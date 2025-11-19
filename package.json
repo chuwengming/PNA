@@ -2,8 +2,12 @@
   "name": "network_v1",
   "version": "0.1.0",
   "private": true,
+  "license": "UNLICENSED",
   "scripts": {
-    "dev": "next dev",
+    "setup-venv": "python3 -m venv venv",
+    "fastapi-dev": "pip3 install -r requirements.txt && python3 -m uvicorn api.index:app --reload",
+    "next-dev": "next dev",
+    "dev": "concurrently \"npm run next-dev\" \"npm run fastapi-dev\"",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
@@ -21,6 +25,7 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "concurrently": "^8.2.2",
     "eslint": "^9",
     "eslint-config-next": "16.0.1",
     "tailwindcss": "^4",
