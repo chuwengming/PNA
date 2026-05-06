@@ -9,6 +9,8 @@ import Image from 'next/image';
 interface Node {
   id: number;
   previousNodes: number[];
+  /** 後端保存的演算法路徑（可選） */
+  prePath?: number[];
   meanTime: number;
   flag: boolean;
   output: number;

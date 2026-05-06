@@ -19,6 +19,7 @@ from urllib.parse import unquote, urlparse
 
 import pymysql
 from pymysql.cursors import DictCursor
+from pymysql.err import OperationalError as PyMySQLOperationalError
 
 app = FastAPI()
 
@@ -50,8 +51,14 @@ class ApiMessageResponse(BaseModel):
 
 
 class NodeInput(BaseModel):
+    """節點設計資料：與前端欄位對齊，並保留演算法用的路徑欄位。"""
+
     id: int = Field(ge=0)
     previousNodes: List[int] = Field(default_factory=list)
+    prePath: List[int] = Field(
+        default_factory=list,
+        description="演算法用的前驅路徑順序（可選，預設空陣列）",
+    )
     meanTime: float = 0.0
     flag: bool = False
     output: float = 0.0
@@ -114,7 +121,11 @@ class SavedNetworkResponse(BaseModel):
 
 
 def _database_config():
-    database_url = os.getenv("DATABASE_URL") or os.getenv("MYSQL_URL")
+    database_url = (
+        os.getenv("DATABASE_URL")
+        or os.getenv("MYSQL_URL")
+        or os.getenv("MYSQL_PUBLIC_URL")
+    )
     if database_url:
         parsed = urlparse(database_url)
         return {
@@ -184,7 +195,8 @@ def init_schema(connection):
                 pass_flag BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY uq_node_tables_owner_name (owner_user_id, name)
+                UNIQUE KEY uq_node_tables_owner_name (owner_user_id, name),
+                KEY idx_node_tables_owner (owner_user_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """
         )
@@ -194,11 +206,13 @@ def init_schema(connection):
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 node_table_id BIGINT NOT NULL,
                 node_id INT NOT NULL,
-                previous_nodes JSON NOT NULL,
-                mean_time DOUBLE NOT NULL DEFAULT 0,
+                previous_nodes JSON NOT NULL COMMENT '前置節點 ID 列表（DAG 邊：來源 -> 本節點）',
+                pre_path JSON NOT NULL COMMENT '演算法用的路徑／順序資訊（JSON 陣列）',
+                mean_time DOUBLE NOT NULL DEFAULT 0 COMMENT '平均時間／均值',
                 flag BOOLEAN NOT NULL DEFAULT FALSE,
                 output DOUBLE NOT NULL DEFAULT 0,
                 UNIQUE KEY uq_node_table_nodes_table_node (node_table_id, node_id),
+                KEY idx_node_table_nodes_table_id (node_table_id),
                 CONSTRAINT fk_node_table_nodes_table
                     FOREIGN KEY (node_table_id)
                     REFERENCES node_tables(id)
@@ -213,11 +227,16 @@ def init_schema(connection):
                 owner_user_id VARCHAR(64) NOT NULL,
                 node_table_id BIGINT NOT NULL,
                 name VARCHAR(191) NOT NULL,
-                nodes_json JSON NOT NULL,
-                graph LONGTEXT NOT NULL,
+                nodes_json JSON NOT NULL COMMENT '快照：完整 NodeInput 列表',
+                graph LONGTEXT NOT NULL COMMENT '網路圖（通常為 data:image/png;base64,...）',
+                graph_format VARCHAR(64) NOT NULL DEFAULT 'image/png;base64-data-url'
+                    COMMENT '圖檔編碼說明',
+                notes TEXT NULL COMMENT '備註或後續分析摘要',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 UNIQUE KEY uq_networks_owner_name (owner_user_id, name),
+                KEY idx_networks_owner (owner_user_id),
+                KEY idx_networks_node_table (node_table_id),
                 CONSTRAINT fk_networks_node_table
                     FOREIGN KEY (node_table_id)
                     REFERENCES node_tables(id)
@@ -225,6 +244,99 @@ def init_schema(connection):
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """
         )
+
+        migrate_schema(connection)
+
+
+def _column_exists(cursor, table: str, column: str) -> bool:
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS c FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+          AND COLUMN_NAME = %s
+        """,
+        (table, column),
+    )
+    row = cursor.fetchone()
+    return row is not None and row["c"] > 0
+
+
+def _index_exists(cursor, table: str, index_name: str) -> bool:
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS c FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+          AND INDEX_NAME = %s
+        """,
+        (table, index_name),
+    )
+    row = cursor.fetchone()
+    return row is not None and row["c"] > 0
+
+
+def migrate_schema(connection):
+    """舊資料庫增量更新（Railway 上既有 DB 不需手動建表亦可自動補欄位）。"""
+    with connection.cursor() as cursor:
+        if not _column_exists(cursor, "node_table_nodes", "pre_path"):
+            try:
+                cursor.execute(
+                    """
+                    ALTER TABLE node_table_nodes
+                    ADD COLUMN pre_path JSON NOT NULL DEFAULT (JSON_ARRAY())
+                    COMMENT '演算法用的路徑／順序資訊（JSON 陣列）'
+                    AFTER previous_nodes
+                    """
+                )
+            except PyMySQLOperationalError:
+                cursor.execute(
+                    """
+                    ALTER TABLE node_table_nodes
+                    ADD COLUMN pre_path JSON NULL
+                    COMMENT '演算法用的路徑／順序資訊（JSON 陣列）'
+                    AFTER previous_nodes
+                    """
+                )
+                cursor.execute(
+                    "UPDATE node_table_nodes SET pre_path = CAST('[]' AS JSON) WHERE pre_path IS NULL"
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE node_table_nodes
+                    MODIFY COLUMN pre_path JSON NOT NULL
+                    COMMENT '演算法用的路徑／順序資訊（JSON 陣列）'
+                    """
+                )
+        if not _column_exists(cursor, "networks", "graph_format"):
+            cursor.execute(
+                """
+                ALTER TABLE networks
+                ADD COLUMN graph_format VARCHAR(64) NOT NULL DEFAULT 'image/png;base64-data-url'
+                COMMENT '圖檔編碼說明'
+                AFTER graph
+                """
+            )
+        if not _column_exists(cursor, "networks", "notes"):
+            cursor.execute(
+                """
+                ALTER TABLE networks
+                ADD COLUMN notes TEXT NULL COMMENT '備註或後續分析摘要'
+                AFTER graph_format
+                """
+            )
+        if not _index_exists(cursor, "node_tables", "idx_node_tables_owner"):
+            cursor.execute(
+                "CREATE INDEX idx_node_tables_owner ON node_tables (owner_user_id)"
+            )
+        if not _index_exists(cursor, "node_table_nodes", "idx_node_table_nodes_table_id"):
+            cursor.execute(
+                "CREATE INDEX idx_node_table_nodes_table_id ON node_table_nodes (node_table_id)"
+            )
+        if not _index_exists(cursor, "networks", "idx_networks_owner"):
+            cursor.execute("CREATE INDEX idx_networks_owner ON networks (owner_user_id)")
+        if not _index_exists(cursor, "networks", "idx_networks_node_table"):
+            cursor.execute("CREATE INDEX idx_networks_node_table ON networks (node_table_id)")
 
 
 @app.on_event("startup")
@@ -409,6 +521,7 @@ def inputs_to_network(nodes: List[NodeInput]):
         pnode = node(pnode_data.id)
         pnode.flag = pnode_data.flag
         pnode.pre_node = sorted(pnode_data.previousNodes)
+        pnode.pre_path = list(pnode_data.prePath)
         pnode.mean_val = float(pnode_data.meanTime)
         pnode.output = float(pnode_data.output)
         network.append(pnode)
@@ -420,6 +533,7 @@ def network_to_inputs(network) -> List[NodeInput]:
         NodeInput(
             id=pnode.id,
             previousNodes=pnode.pre_node,
+            prePath=list(getattr(pnode, "pre_path", None) or []),
             meanTime=round(pnode.mean_val, 2),
             flag=pnode.flag,
             output=pnode.output,
@@ -428,11 +542,23 @@ def network_to_inputs(network) -> List[NodeInput]:
     ]
 
 
+def _decode_json_column(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        return json.loads(value)
+    return list(value)
+
+
 def row_to_node_table(connection, table_row) -> NodeTableResponse:
     with connection.cursor() as cursor:
         cursor.execute(
             """
-            SELECT node_id, previous_nodes, mean_time, flag, output
+            SELECT node_id, previous_nodes, pre_path, mean_time, flag, output
             FROM node_table_nodes
             WHERE node_table_id = %s
             ORDER BY node_id ASC
@@ -444,7 +570,8 @@ def row_to_node_table(connection, table_row) -> NodeTableResponse:
     nodes = [
         NodeInput(
             id=row["node_id"],
-            previousNodes=json.loads(row["previous_nodes"]),
+            previousNodes=_decode_json_column(row["previous_nodes"]),
+            prePath=_decode_json_column(row.get("pre_path")),
             meanTime=float(row["mean_time"]),
             flag=bool(row["flag"]),
             output=float(row["output"]),
@@ -468,13 +595,14 @@ def save_node_rows(connection, node_table_id: int, nodes: List[NodeInput]):
             cursor.execute(
                 """
                 INSERT INTO node_table_nodes
-                    (node_table_id, node_id, previous_nodes, mean_time, flag, output)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                    (node_table_id, node_id, previous_nodes, pre_path, mean_time, flag, output)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     node_table_id,
                     pnode.id,
                     json.dumps(pnode.previousNodes),
+                    json.dumps(pnode.prePath),
                     pnode.meanTime,
                     pnode.flag,
                     pnode.output,
@@ -833,7 +961,9 @@ def create_network_from_table(request: NetworkCreateRequest):
         graph_base64 = network_graph_to_base64(network)
         graph = f"data:image/png;base64,{graph_base64}"
 
-        nodes_json = json.dumps([node_input.dict() for node_input in node_table.nodes])
+        nodes_json = json.dumps(
+            [node_input.model_dump() for node_input in node_table.nodes]
+        )
         with connection.cursor() as cursor:
             try:
                 cursor.execute(
