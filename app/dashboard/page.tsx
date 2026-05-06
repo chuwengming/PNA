@@ -25,15 +25,20 @@ interface EditableNode {
 
 // 定義網路型別
 interface Network {
+  id: number;
   name: string;
+  nodeTableId: number;
   nodes: Node[];
+  graph: string;
 }
 
 // 定義節點參數資料表型別
 interface NodeTable {
+  id: number;
+  ownerUserId: string;
   name: string;
-  nodes: EditableNode[];
-  passFlag?: boolean;
+  nodes: Node[];
+  passFlag: boolean;
 }
 
 // 定義表單型別
@@ -44,6 +49,13 @@ interface NodeForm {
 
 interface GenerateForm {
   nodeNumbers: string;
+}
+
+interface ReviewResponse {
+  success: boolean;
+  passed: boolean;
+  errors: string[];
+  nodeTable?: NodeTable;
 }
 
 // API 響應型別
@@ -59,6 +71,33 @@ interface NetworkGenerationResponse {
   }>;
   graph: string;
 }
+
+const editableToNode = (node: EditableNode): Node => ({
+  id: node.id,
+  previousNodes: node.previousNodes.trim() === ''
+    ? []
+    : node.previousNodes.split(',').map((value) => parseInt(value.trim(), 10)),
+  meanTime: Number.isFinite(parseFloat(node.meanTime)) ? parseFloat(node.meanTime) : 0,
+  flag: node.flag,
+  output: node.output
+});
+
+const nodeToEditable = (node: Node): EditableNode => ({
+  id: node.id,
+  previousNodes: node.previousNodes.join(', '),
+  meanTime: String(node.meanTime),
+  flag: node.flag,
+  output: node.output
+});
+
+const apiErrorMessage = async (response: Response) => {
+  const payload = await response.json().catch(() => null);
+  const detail = payload?.detail;
+  if (typeof detail === 'string') return detail;
+  if (detail?.message) return detail.message;
+  if (payload?.message) return payload.message;
+  return `HTTP error! status: ${response.status}`;
+};
 
 export default function DashboardPage() {
   const { data: session, status } = useSession();
@@ -135,6 +174,38 @@ export default function DashboardPage() {
     }
   }, [status, router]);
 
+  const ownerUserId = session?.user?.id ? String(session.user.id) : '';
+
+  useEffect(() => {
+    if (!ownerUserId) return;
+
+    const loadPersistedData = async () => {
+      try {
+        const [nodeTableResponse, networkResponse] = await Promise.all([
+          fetch(`/api/python/node-tables?ownerUserId=${encodeURIComponent(ownerUserId)}`),
+          fetch(`/api/python/networks?ownerUserId=${encodeURIComponent(ownerUserId)}`)
+        ]);
+
+        if (!nodeTableResponse.ok) {
+          throw new Error(await apiErrorMessage(nodeTableResponse));
+        }
+        if (!networkResponse.ok) {
+          throw new Error(await apiErrorMessage(networkResponse));
+        }
+
+        const persistedNodeTables: NodeTable[] = await nodeTableResponse.json();
+        const persistedNetworks: Network[] = await networkResponse.json();
+        setNodeTables(persistedNodeTables);
+        setNetworks(persistedNetworks);
+      } catch (error) {
+        console.error('Error loading persisted dashboard data:', error);
+        setGenerationError(error instanceof Error ? error.message : 'Failed to load persisted data');
+      }
+    };
+
+    loadPersistedData();
+  }, [ownerUserId]);
+
   if (status === 'loading') {
     return (
       <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 flex items-center justify-center">
@@ -201,9 +272,13 @@ export default function DashboardPage() {
   };
 
   // 儲存節點參數資料表
-  const handleSaveNodeTable = () => {
+  const handleSaveNodeTable = async () => {
   if (!networkName.trim()) {
     alert('Please enter a table name.');
+    return;
+  }
+  if (!ownerUserId) {
+    alert('Please sign in again before saving.');
     return;
   }
 
@@ -216,22 +291,42 @@ export default function DashboardPage() {
     alert('Please add at least one valid node.');
     return;
   }
-  
-  const newNodeTable: NodeTable = {
-    name: networkName,
-    nodes: validModalNodes
-  };
-  
-  setNodeTables([...nodeTables, newNodeTable]);
-  setNetworkName('');
-  setShowNetworkNameModal(false);
-  setShowAddNodeModal(false);
-  alert(`Node Table "${newNodeTable.name}" saved successfully!`);
+
+  try {
+    const response = await fetch('/api/python/node-tables', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ownerUserId,
+        name: networkName,
+        nodes: validModalNodes.map(editableToNode)
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(await apiErrorMessage(response));
+    }
+
+    const newNodeTable: NodeTable = await response.json();
+    setNodeTables(prevNodeTables => [newNodeTable, ...prevNodeTables]);
+    setNetworkName('');
+    setShowNetworkNameModal(false);
+    setShowAddNodeModal(false);
+    alert(`Node Table "${newNodeTable.name}" saved successfully!`);
+  } catch (error) {
+    console.error('Error saving node table:', error);
+    alert(error instanceof Error ? error.message : 'Failed to save node table.');
+  }
 };
 
   // 更新節點參數資料表
-  const handleUpdateNodeTable = () => {
-  const tableIndex = nodeTables.findIndex(t => t.name === selectedNodeTable);
+  const handleUpdateNodeTable = async () => {
+  if (!ownerUserId) {
+    alert('Please sign in again before saving.');
+    return;
+  }
+
+  const tableIndex = nodeTables.findIndex(t => String(t.id) === selectedNodeTable);
   if (tableIndex === -1) {
     alert('Could not find the selected table to update.');
     return;
@@ -247,26 +342,45 @@ export default function DashboardPage() {
     return;
   }
 
-  const updatedNodeTables = [...nodeTables];
-  updatedNodeTables[tableIndex] = {
-    ...updatedNodeTables[tableIndex],
-    nodes: validModalNodes
-  };
+  const selectedTable = nodeTables[tableIndex];
 
-  setNodeTables(updatedNodeTables);
-  setShowEditNodeModal(false);
-  setIsEditingTable(false);
-  setSelectedNodeTable('');
-  alert(`Node Table "${selectedNodeTable}" updated successfully!`);
+  try {
+    const response = await fetch(`/api/python/node-tables/${selectedTable.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ownerUserId,
+        name: selectedTable.name,
+        nodes: validModalNodes.map(editableToNode)
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(await apiErrorMessage(response));
+    }
+
+    const updatedNodeTable: NodeTable = await response.json();
+    setNodeTables(prevNodeTables =>
+      prevNodeTables.map(table => table.id === updatedNodeTable.id ? updatedNodeTable : table)
+    );
+    setShowEditNodeModal(false);
+    setIsEditingTable(false);
+    setSelectedNodeTable('');
+    alert(`Node Table "${updatedNodeTable.name}" updated successfully!`);
+  } catch (error) {
+    console.error('Error updating node table:', error);
+    alert(error instanceof Error ? error.message : 'Failed to update node table.');
+  }
 };
 
   // 選擇網路
-  const handleSelectNetwork = (networkName: string) => {
-    setSelectedNetwork(networkName);
-    const network = networks.find(n => n.name === networkName);
+  const handleSelectNetwork = (networkId: string) => {
+    setSelectedNetwork(networkId);
+    const network = networks.find(n => String(n.id) === networkId);
     if (network) {
       setNodes([...network.nodes]);
       setCurrentNodeId(network.nodes.length);
+      setNetworkGraph(network.graph);
     }
   };
 
@@ -274,6 +388,10 @@ export default function DashboardPage() {
   const handleRandomGenerate = async () => {
     if (!randomNetworkName.trim()) {
       alert('Please enter a network name.');
+      return;
+    }
+    if (!ownerUserId) {
+      alert('Please sign in again before saving.');
       return;
     }
     const nodeCount = parseInt(generateForm.nodeNumbers);
@@ -330,14 +448,24 @@ export default function DashboardPage() {
           output: node.output
         }));
 
-        const newNodeTable: NodeTable = {
-          name: randomNetworkName,
-          nodes: editableNodes
-        };
+        const saveResponse = await fetch('/api/python/node-tables', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ownerUserId,
+            name: randomNetworkName,
+            nodes: editableNodes.map(editableToNode)
+          })
+        });
 
-        setNodeTables(prevNodeTables => [...prevNodeTables, newNodeTable]);
+        if (!saveResponse.ok) {
+          throw new Error(await apiErrorMessage(saveResponse));
+        }
+
+        const newNodeTable: NodeTable = await saveResponse.json();
+        setNodeTables(prevNodeTables => [newNodeTable, ...prevNodeTables]);
         
-        alert(`Successfully generated and saved network "${randomNetworkName}" with ${nodeCount} nodes!`);
+        alert(`Successfully generated and saved Node Table "${randomNetworkName}" with ${nodeCount} nodes!`);
       } else {
         throw new Error('Generation failed');
       }
@@ -359,68 +487,51 @@ export default function DashboardPage() {
       alert('Please select a node table.');
       return;
     }
-    
-    const networkName = graphNetworkName.trim() || selectedPassedTable;
+    if (!ownerUserId) {
+      alert('Please sign in again before creating a network.');
+      return;
+    }
+
+    const table = nodeTables.find(t => String(t.id) === selectedPassedTable);
+    if (!table) {
+      alert('Selected table not found.');
+      return;
+    }
+
+    const networkName = graphNetworkName.trim() || table.name;
     
     setIsGraphing(true);
     setShowGraphNetworkModal(false);
     
     try {
-      const table = nodeTables.find(t => t.name === selectedPassedTable);
-      if (!table) {
-        throw new Error('Selected table not found.');
-      }
-      
-      const networkNodes = table.nodes.map(node => ({
-        id: node.id,
-        previousNodes: node.previousNodes === '' 
-          ? [] 
-          : node.previousNodes.split(',').map(s => parseInt(s.trim())),
-        meanTime: parseFloat(node.meanTime),
-        flag: node.flag,
-        output: node.output
-      }));
-      
-      const response = await fetch('/api/python/graph-network', {
+      const response = await fetch('/api/python/networks/graph', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          nodes: networkNodes
+          ownerUserId,
+          nodeTableId: table.id,
+          networkName
         }),
       });
       
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        throw new Error(await apiErrorMessage(response));
       }
       
-      const data: NetworkGenerationResponse = await response.json();
+      const data: Network = await response.json();
       
-      if (data.success) {
-        const convertedNodes: Node[] = data.nodes.map(node => ({
-          id: node.id,
-          previousNodes: node.pre_node,
-          meanTime: node.mean_val,
-          flag: node.flag,
-          output: node.output
-        }));
-        
-        setNodes(convertedNodes);
-        setCurrentNodeId(convertedNodes.length);
-        
-        setNetworkGraph(data.graph);
-        
-        const newNetwork: Network = {
-          name: networkName,
-          nodes: convertedNodes
-        };
-        setNetworks(prevNetworks => [...prevNetworks, newNetwork]);
-        
-        alert(`Successfully created network "${networkName}"!`);
-      } else {
-        throw new Error('Graph generation failed');
-      }
+      setNodes(data.nodes);
+      setCurrentNodeId(data.nodes.length);
+      setNetworkGraph(data.graph);
+      setNetworks(prevNetworks => {
+        const existingIndex = prevNetworks.findIndex(network => network.id === data.id);
+        if (existingIndex === -1) return [data, ...prevNetworks];
+        return prevNetworks.map(network => network.id === data.id ? data : network);
+      });
+      
+      alert(`Successfully created network "${networkName}"!`);
       
     } catch (error) {
       console.error('Error graphing network:', error);
@@ -434,92 +545,54 @@ export default function DashboardPage() {
   };
 
   // 審查節點參數資料表
-  const handleReviewNodeTable = () => {
-    const table = nodeTables.find(t => t.name === selectedNodeTableForReview);
+  const handleReviewNodeTable = async () => {
+    if (!ownerUserId) {
+      alert('Please sign in again before reviewing.');
+      return;
+    }
+
+    const table = nodeTables.find(t => String(t.id) === selectedNodeTableForReview);
     if (!table) {
       alert('Selected node table not found.');
       return;
     }
 
-    const nodes = table.nodes;
-    const N = nodes.length;
-    const errors: string[] = [];
-
-    if (N === 0) {
-      errors.push('節點表不能為空。');
-    } else {
-      // 規則：node(0)的Previous Nodes欄位資料必須為空的
-      if (nodes[0].previousNodes.trim() !== '') {
-        errors.push("節點 0 (起始節點) 的 'Previous Nodes' 欄位必須為空。");
-      }
-
-      const allReferencedNodeIds = new Set<number>();
-
-      for (const node of nodes) {
-        // 規則：所有節點的Flag為預設值false
-        if (node.flag !== false) {
-          errors.push(`節點 ${node.id} 的 'Flag' 欄位必須為 false。`);
-        }
-        // 規則：Output欄位資料都必須保持預設值0.0
-        if (node.output !== 0.0) {
-          errors.push(`節點 ${node.id} 的 'Output' 欄位必須為 0.0。`);
-        }
-        // 規則：所有節點的Mean Value欄位輸入資料都必須為數值
-        const meanTime = parseFloat(node.meanTime);
-        if (isNaN(meanTime) || !isFinite(meanTime)) {
-          errors.push(`節點 ${node.id} 的 'Mean Time' 欄位必須是有效的數值。`);
-        }
-
-        // --- Previous Nodes 欄位驗證 ---
-        const prevNodesStr = node.previousNodes.trim();
-        const prevs = prevNodesStr === '' ? [] : prevNodesStr.split(',').map(s => parseFloat(s.trim()));
-
-        if (prevs.some(isNaN)) {
-          errors.push(`節點 ${node.id} 的 'Previous Nodes' 欄位包含無效的 ID。`);
-        } else {
-          // 規則：內容不得含有該節點自己的ID值
-          if (prevs.includes(node.id)) {
-            errors.push(`節點 ${node.id} 的 'Previous Nodes' 欄位不能包含自己的 ID。`);
-          }
-          // 規則：所有節點的Previous Nodes欄位資料，不得存在N-1的ID值
-          if (prevs.includes(N - 1)) {
-            errors.push(`節點 ${node.id} 的 'Previous Nodes' 欄位不能包含終端節點 ID (${N - 1})。`);
-          }
-          // 規則：為list資料型態，數值為正整數(節點ID值)
-          if (prevs.some(id => !Number.isInteger(id) || id < 0)) {
-            errors.push(`節點 ${node.id} 的 'Previous Nodes' 欄位必須為正整數。`);
-          }
-          
-          prevs.forEach(id => allReferencedNodeIds.add(id));
-        }
-
-        // 規則：node(0)除外，其餘節點均至少要有一個數值
-        if (node.id !== 0 && prevs.length === 0) {
-          errors.push(`節點 ${node.id} (非起始節點) 至少要有一個 'Previous Node'。`);
-        }
-      }
-
-      // 規則：node(N-1)除外，其餘節點所屬的ID值，至少一次要出現在其他節點Previous Nodes欄位內
-      if (N > 1) {
-        for (let i = 0; i < N - 1; i++) {
-          if (!allReferencedNodeIds.has(i)) {
-            errors.push(`節點 ${i} 未被任何其他節點的 'Previous Nodes' 引用，可能導致網路斷開。`);
-          }
-        }
-      }
-    }
-
-    if (errors.length > 0) {
-      setReviewErrors(errors);
-      setShowReviewErrorsModal(true);
-    } else {
-      const updatedNodeTables = nodeTables.map(t => 
-        t.name === selectedNodeTableForReview ? { ...t, passFlag: true } : t
+    try {
+      const response = await fetch(
+        `/api/python/node-tables/${table.id}/review?ownerUserId=${encodeURIComponent(ownerUserId)}`,
+        { method: 'POST' }
       );
-      setNodeTables(updatedNodeTables);
-      alert(`Node Table "${selectedNodeTableForReview}" has passed the review!`);
+
+      if (!response.ok) {
+        throw new Error(await apiErrorMessage(response));
+      }
+
+      const review: ReviewResponse = await response.json();
+
+      if (!review.passed) {
+        setReviewErrors(review.errors);
+        setShowReviewErrorsModal(true);
+        const reviewedTable = review.nodeTable;
+        if (reviewedTable) {
+          setNodeTables(prevNodeTables =>
+            prevNodeTables.map(nodeTable => nodeTable.id === reviewedTable.id ? reviewedTable : nodeTable)
+          );
+        }
+        return;
+      }
+
+      const reviewedTable = review.nodeTable;
+      if (reviewedTable) {
+        setNodeTables(prevNodeTables =>
+          prevNodeTables.map(nodeTable => nodeTable.id === reviewedTable.id ? reviewedTable : nodeTable)
+        );
+      }
+      alert(`Node Table "${table.name}" has passed the review!`);
       setShowReviewNodeModal(false);
       setSelectedNodeTableForReview('');
+    } catch (error) {
+      console.error('Error reviewing node table:', error);
+      alert(error instanceof Error ? error.message : 'Failed to review node table.');
     }
   };
 
@@ -595,7 +668,7 @@ export default function DashboardPage() {
                   <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
                   </svg>
-                  Creat Node Table
+                  Create Node Table
                 </button>
                 <button
                   onClick={() => {
@@ -704,13 +777,13 @@ export default function DashboardPage() {
                   >
                     <option value="">Select Network...</option>
                     {networks.map((network) => (
-                      <option key={network.name} value={network.name}>
+                      <option key={network.id} value={network.id}>
                         {network.name}
                       </option>
                     ))}
                   </select>
                   <p className="text-xs text-gray-500 mt-1">
-                    There are {networks.length} networks avalilable
+                    There are {networks.length} networks available
                   </p>
                 </div>
                 <button
@@ -1063,7 +1136,7 @@ export default function DashboardPage() {
                   >
                     <option value="">選擇要編輯的資料表...</option>
                     {nodeTables.map(table => (
-                      <option key={table.name} value={table.name}>{table.name}</option>
+                      <option key={table.id} value={table.id}>{table.name}</option>
                     ))}
                   </select>
                 </div>
@@ -1076,9 +1149,9 @@ export default function DashboardPage() {
                   </button>
                   <button
                     onClick={() => {
-                      const table = nodeTables.find(t => t.name === selectedNodeTable);
+                      const table = nodeTables.find(t => String(t.id) === selectedNodeTable);
                       if (table) {
-                        setModalNodes(table.nodes);
+                        setModalNodes(table.nodes.map(nodeToEditable));
                         setIsEditingTable(true);
                       } else {
                         alert('Please select a node table to edit.');
@@ -1184,7 +1257,7 @@ export default function DashboardPage() {
                 >
                   <option value="">選擇要審查的資料表...</option>
                   {nodeTables.map(table => (
-                    <option key={table.name} value={table.name}>
+                    <option key={table.id} value={table.id}>
                       {table.name} {table.passFlag && ' (Passed)'}
                     </option>
                   ))}
@@ -1224,7 +1297,8 @@ export default function DashboardPage() {
                   value={selectedPassedTable}
                   onChange={(e) => {
                     setSelectedPassedTable(e.target.value);
-                    setGraphNetworkName(e.target.value);
+                    const table = nodeTables.find(nodeTable => String(nodeTable.id) === e.target.value);
+                    setGraphNetworkName(table?.name || '');
                   }}
                   className="w-full px-4 py-3 bg-slate-900 border border-blue-500/30 rounded-lg text-white focus:outline-none focus:border-cyan-400"
                 >
@@ -1232,7 +1306,7 @@ export default function DashboardPage() {
                   {nodeTables
                     .filter(table => table.passFlag === true)
                     .map(table => (
-                      <option key={table.name} value={table.name}>
+                      <option key={table.id} value={table.id}>
                         {table.name}
                       </option>
                     ))}
@@ -1249,7 +1323,7 @@ export default function DashboardPage() {
                   type="text"
                   value={graphNetworkName}
                   onChange={(e) => setGraphNetworkName(e.target.value)}
-                  placeholder={selectedPassedTable || "Enter network name"}
+                  placeholder={nodeTables.find(table => String(table.id) === selectedPassedTable)?.name || "Enter network name"}
                   className="w-full px-4 py-3 bg-slate-900 border border-blue-500/30 rounded-lg text-white focus:outline-none focus:border-cyan-400"
                 />
                 <p className="text-xs text-gray-500 mt-1">

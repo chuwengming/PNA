@@ -4,12 +4,15 @@
   "private": true,
   "license": "UNLICENSED",
   "scripts": {
-    "setup-venv": "python3 -m venv venv",
-    "fastapi-dev": "pip3 install -r requirements.txt && python3 -m uvicorn api.index:app --reload",
+    "setup-venv": "python -m venv venv",
+    "install-python": "python -m pip install -r requirements.txt",
+    "fastapi-dev": "npm run install-python && python -m uvicorn api.index:app --reload",
+    "fastapi-start": "python -m uvicorn api.index:app --host 127.0.0.1 --port 8000",
     "next-dev": "next dev",
     "dev": "concurrently \"npm run next-dev\" \"npm run fastapi-dev\"",
     "build": "next build",
     "start": "next start",
+    "railway-start": "npm run install-python && concurrently \"npm run fastapi-start\" \"next start -H 0.0.0.0\"",
     "lint": "eslint"
   },
   "dependencies": {

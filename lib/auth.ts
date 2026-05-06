@@ -1,8 +1,13 @@
 import NextAuth from 'next-auth';
 import GoogleProvider from 'next-auth/providers/google';
 import CredentialsProvider from 'next-auth/providers/credentials';
-import bcrypt from 'bcryptjs';
-import { findUserByEmail } from '@/lib/db';
+import { callPythonApi } from '@/lib/python-api';
+
+interface AuthUser {
+  id: number;
+  email: string;
+  name?: string | null;
+}
 
 export const {
   handlers: { GET, POST },
@@ -10,6 +15,7 @@ export const {
   signIn,
   signOut,
 } = NextAuth({
+  trustHost: true,
   providers: [
     GoogleProvider({
       clientId: process.env.GOOGLE_CLIENT_ID,
@@ -26,28 +32,26 @@ export const {
           return null;
         }
 
-        const email = credentials.email as string;
-        const password = credentials.password as string;
+        try {
+          const user = await callPythonApi<AuthUser | null>('/api/python/auth/verify', {
+            method: 'POST',
+            body: JSON.stringify({
+              email: credentials.email,
+              password: credentials.password,
+            }),
+          });
 
-        const user = findUserByEmail(email);
+          if (!user) {
+            return null;
+          }
 
-        if (!user || !user.password) {
-          return null;
-        }
-
-        const isPasswordValid = await bcrypt.compare(password, user.password);
-
-        if (isPasswordValid) {
-          // [重要] 修正點：
-          // 使用 nullish coalescing operator (??)
-          // 如果 user.name 是 null 或 undefined，就將其轉換為 undefined。
-          // 這樣可以確保回傳物件的 name 屬性類型為 string | undefined，符合 NextAuth 的 User 類型。
           return {
-            id: user.id,
-            name: user.name ?? undefined, // <-- 這裡就是修正之處
+            id: String(user.id),
+            name: user.name ?? undefined,
             email: user.email,
           };
-        } else {
+        } catch (error) {
+          console.error('Credentials authorization error:', error);
           return null;
         }
       },
@@ -63,6 +67,24 @@ export const {
       }
       if (account?.provider === 'google') {
         token.provider = 'google';
+        if (user?.email) {
+          try {
+            const dbUser = await callPythonApi<AuthUser>('/api/python/auth/oauth-user', {
+              method: 'POST',
+              body: JSON.stringify({
+                email: user.email,
+                name: user.name,
+                provider: 'google',
+              }),
+            });
+            token.id = String(dbUser.id);
+          } catch (error) {
+            console.error('Google user persistence error:', error);
+            token.id = account.providerAccountId
+              ? `google:${account.providerAccountId}`
+              : user.email;
+          }
+        }
       }
       return token;
     },
