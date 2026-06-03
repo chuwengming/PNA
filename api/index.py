@@ -187,7 +187,6 @@ def init_schema(connection):
                 node_count INT NOT NULL,
                 predecessors_json JSON NOT NULL,
                 mean_times_json JSON NOT NULL,
-                graph LONGTEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 UNIQUE KEY uq_saved_networks_user_name (user_id, name),
@@ -200,6 +199,22 @@ def init_schema(connection):
         )
 
 
+def migrate_schema(connection):
+    """移除舊版 saved_networks.graph 欄位（若存在）。"""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'saved_networks'
+              AND COLUMN_NAME = 'graph'
+            """
+        )
+        row = cursor.fetchone()
+        if row and row["cnt"]:
+            cursor.execute("ALTER TABLE saved_networks DROP COLUMN graph")
+
+
 @app.on_event("startup")
 def startup():
     config = _database_config()
@@ -208,6 +223,7 @@ def startup():
 
     with db_connection() as connection:
         init_schema(connection)
+        migrate_schema(connection)
 
 class node:
     def __init__(self, node_id):
@@ -435,6 +451,8 @@ def row_to_saved_network_response(row) -> SavedNetworkResponse:
     mean_times = json.loads(mean_times_raw) if isinstance(mean_times_raw, str) else mean_times_raw
     node_count = int(row["node_count"])
     nodes = node_inputs_from_compact(node_count, predecessors, mean_times)
+    network = inputs_to_network(nodes)
+    graph_uri = f"data:image/png;base64,{network_graph_to_base64(network)}"
     return SavedNetworkResponse(
         id=row["id"],
         userId=int(row["user_id"]),
@@ -443,7 +461,7 @@ def row_to_saved_network_response(row) -> SavedNetworkResponse:
         predecessors=predecessors,
         meanTimes=mean_times,
         nodes=nodes,
-        graph=row["graph"],
+        graph=graph_uri,
     )
 
 
@@ -697,10 +715,6 @@ def save_network_graph(request: SaveNetworkRequest):
         init_schema(connection)
         ensure_user_exists(connection, request.userId)
 
-        network = inputs_to_network(request.nodes)
-        graph_base64 = network_graph_to_base64(network)
-        graph = f"data:image/png;base64,{graph_base64}"
-
         node_count, predecessors, mean_times = compact_from_node_inputs(request.nodes)
         predecessors_payload = json.dumps(predecessors)
         mean_times_payload = json.dumps(mean_times)
@@ -711,14 +725,13 @@ def save_network_graph(request: SaveNetworkRequest):
                     """
                     INSERT INTO saved_networks (
                         user_id, name, node_count,
-                        predecessors_json, mean_times_json, graph
+                        predecessors_json, mean_times_json
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
                         node_count = VALUES(node_count),
                         predecessors_json = VALUES(predecessors_json),
                         mean_times_json = VALUES(mean_times_json),
-                        graph = VALUES(graph),
                         updated_at = CURRENT_TIMESTAMP
                     """,
                     (
@@ -727,7 +740,6 @@ def save_network_graph(request: SaveNetworkRequest):
                         node_count,
                         predecessors_payload,
                         mean_times_payload,
-                        graph,
                     ),
                 )
             except pymysql.err.IntegrityError as exc:

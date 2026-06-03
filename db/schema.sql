@@ -1,4 +1,4 @@
--- Railway MySQL: users + saved_networks (minimal schema, with FK)
+-- Railway MySQL: users + saved_networks (no graph column — rendered on demand)
 
 SET NAMES utf8mb4;
 SET FOREIGN_KEY_CHECKS = 0;
@@ -20,7 +20,6 @@ CREATE TABLE IF NOT EXISTS saved_networks (
   node_count INT NOT NULL,
   predecessors_json JSON NOT NULL COMMENT '長度 N：每個節點的前置節點 ID 列表',
   mean_times_json JSON NOT NULL COMMENT '長度 N：每個節點的 mean time',
-  graph LONGTEXT NOT NULL COMMENT 'data:image/png;base64,...',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uq_saved_networks_user_name (user_id, name),
@@ -31,3 +30,6 @@ CREATE TABLE IF NOT EXISTS saved_networks (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 SET FOREIGN_KEY_CHECKS = 1;
+
+-- 若資料表已存在且仍有 graph 欄位，可執行：
+-- ALTER TABLE saved_networks DROP COLUMN graph;
