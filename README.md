@@ -26,10 +26,27 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
 
 Create a Railway MySQL service and expose its connection string to this app as `DATABASE_URL` or `MYSQL_URL`.
 
-Set the app service start command to:
+Set the app service **Start Command** to (or leave empty if Railpack uses `npm run railway-start` from `package.json`):
 
 ```bash
 npm run railway-start
+```
+
+This runs `install-python` (creates a **Linux** `venv` on the server) then starts FastAPI + Next.js.
+
+### Python virtualenv on Railway (important)
+
+- **Local (Windows)** uses `venv/Scripts/python.exe`.
+- **Railway (Linux)** uses `venv/bin/python`.
+- Do **not** commit the `venv/` folder to Git. A Windows venv in the repo breaks deploy (`No module named uvicorn`, `skip (already installed)`).
+- After pulling latest code, redeploy with **clear build cache** once so the old Windows `venv` is not in the image.
+
+Successful deploy logs should include:
+
+```text
+[venv] creating with python3
+[install-python] python: /app/venv/bin/python
+Uvicorn running on http://127.0.0.1:8000
 ```
 
 Required environment variables:
@@ -75,6 +92,6 @@ FastAPI initializes these tables on startup (or run `db/schema.sql` on Railway):
 
 **Workflow:** Create Network / Edit Network / Review Network / Graph Network / Random Generate all persist to `saved_networks`. Reload the page and use **Edit Network** to continue editing.
 
-**Local vs Railway:** The app binds networks to numeric `users.id` in **one MySQL database**. Your laptop (`npm run dev`) and `https://pna-production.up.railway.app` use **separate** Railway/local `DATABASE_URL` instances unless you point both to the same server. Same Google email on both sites gets the same email in `users`, but **user id and networks are per database**. The dashboard header shows `DB user id` so you can confirm which account the API is using.
+**Same `DATABASE_URL` on PC and Railway:** Networks are keyed by numeric `users.id`. The dashboard shows `DB user id`. If Google login works but MySQL does not, check `/api/python/health/db` and deploy logs for `Uvicorn` and `venv/bin/python`.
 
 Manual schema: see `db/schema.sql`.

@@ -1,12 +1,35 @@
 /**
  * Railway 正式環境：同時啟動 FastAPI + Next（不使用 concurrently，避免 production 缺 devDependencies）。
+ * 須先執行 npm run install-python（建立目前作業系統適用的 venv）。
  */
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { getVenvPython, isVenvReady } from './venv-python.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const port = process.env.PORT || '3000';
+
+function assertLinuxVenvWithUvicorn() {
+  if (!isVenvReady()) {
+    console.error(
+      '[railway] FATAL: venv/bin/python 不存在。請確認 railway-start 含 npm run install-python，且未部署 Windows venv。',
+    );
+    process.exit(1);
+  }
+  const python = getVenvPython();
+  const check = spawnSync(python, ['-m', 'uvicorn', '--version'], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+  });
+  if (check.status !== 0) {
+    console.error('[railway] FATAL: venv 內沒有 uvicorn，請重新執行 npm run install-python');
+    process.exit(1);
+  }
+  console.log('[railway] venv ok:', python, check.stdout?.trim() || '');
+}
+
+assertLinuxVenvWithUvicorn();
 
 function runNodeScript(scriptArgs, label) {
   const child = spawn('node', scriptArgs, {
@@ -14,12 +37,14 @@ function runNodeScript(scriptArgs, label) {
     stdio: 'inherit',
     env: process.env,
   });
-  child.on('exit', (code) => {
-    if (code !== 0 && code !== null) {
-      console.error(`[${label}] exited with code ${code}`);
-      process.exit(code);
-    }
-  });
+  if (label === 'fastapi') {
+    child.on('exit', (code) => {
+      if (code !== 0 && code !== null) {
+        console.error(`[${label}] exited with code ${code}`);
+        process.exit(code);
+      }
+    });
+  }
   return child;
 }
 
