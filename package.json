@@ -10,9 +10,9 @@
     "fastapi-start": "node scripts/run-uvicorn.mjs api.index:app --host 127.0.0.1 --port 8000",
     "next-dev": "next dev",
     "dev": "concurrently \"npm run next-dev\" \"npm run fastapi-dev\"",
-    "build": "next build",
+    "build": "next build && npm run install-python",
     "start": "next start",
-    "railway-start": "npm run install-python && concurrently \"npm run fastapi-start\" \"next start -H 0.0.0.0\"",
+    "railway-start": "node scripts/start-production.mjs",
     "lint": "eslint",
     "dev:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-dev.ps1"
   },

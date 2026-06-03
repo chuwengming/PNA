@@ -13,13 +13,12 @@ import base64
 import bcrypt
 import json
 import os
-from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional
-from urllib.parse import unquote, urlparse
 
 import pymysql
-from pymysql.cursors import DictCursor
+
+from api.database import db_connection
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -132,51 +131,18 @@ class SavedNetworkResponse(BaseModel):
     passReview: bool
 
 
-def _database_config():
-    database_url = os.getenv("DATABASE_URL") or os.getenv("MYSQL_URL")
-    if database_url:
-        parsed = urlparse(database_url)
-        return {
-            "host": parsed.hostname,
-            "port": parsed.port or 3306,
-            "user": unquote(parsed.username) if parsed.username else None,
-            "password": unquote(parsed.password) if parsed.password else None,
-            "database": parsed.path.lstrip("/"),
-        }
-
-    return {
-        "host": os.getenv("MYSQL_HOST"),
-        "port": int(os.getenv("MYSQL_PORT", "3306")),
-        "user": os.getenv("MYSQL_USER"),
-        "password": os.getenv("MYSQL_PASSWORD"),
-        "database": os.getenv("MYSQL_DATABASE"),
-    }
-
-
-@contextmanager
-def db_connection():
-    config = _database_config()
-    missing = [key for key in ("host", "user", "database") if not config.get(key)]
-    if missing:
-        raise HTTPException(
-            status_code=500,
-            detail=f"MySQL is not configured. Missing: {', '.join(missing)}",
-        )
-
-    connection = pymysql.connect(
-        **config,
-        charset="utf8mb4",
-        cursorclass=DictCursor,
-        autocommit=False,
-    )
+@app.get("/api/python/health/db")
+def health_db():
     try:
-        yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+        with db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1 AS ok")
+        return {"ok": True, "message": "MySQL 連線成功"}
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"ok": False, "message": exc.detail},
+        )
 
 
 def init_schema(connection):
@@ -248,8 +214,8 @@ def migrate_schema(connection):
 
 @app.on_event("startup")
 def startup():
-    config = _database_config()
-    if not all(config.get(key) for key in ("host", "user", "database")):
+    if not (os.getenv("DATABASE_URL") or os.getenv("MYSQL_URL") or os.getenv("MYSQL_HOST")):
+        print("WARN: MySQL env not set for FastAPI")
         return
 
     with db_connection() as connection:
