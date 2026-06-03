@@ -36,7 +36,7 @@ export default function SignUpPage() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
       });
 
       const data = await response.json();
@@ -48,8 +48,9 @@ export default function SignUpPage() {
       }
 
       // Auto login after successful registration
+      const normalizedEmail = email.trim().toLowerCase();
       const result = await signIn('credentials', {
-        email,
+        email: normalizedEmail,
         password,
         redirect: false,
       });
@@ -61,7 +62,7 @@ export default function SignUpPage() {
         router.push('/dashboard');
       }
     } catch (error) {
-      setError('發生錯誤，請稍後再試');
+      setError(error instanceof Error ? error.message : '發生錯誤，請稍後再試');
       setLoading(false);
     }
   };

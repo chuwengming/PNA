@@ -68,21 +68,57 @@ export const {
       if (account?.provider === 'google') {
         token.provider = 'google';
         if (user?.email) {
+          const oauthPayload = JSON.stringify({
+            email: user.email,
+            name: user.name,
+            provider: 'google',
+          });
+
+          const persistGoogleUser = async (): Promise<AuthUser> => {
+            const maxAttempts = 4;
+            let lastError: unknown;
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+              try {
+                return await callPythonApi<AuthUser>('/api/python/auth/oauth-user', {
+                  method: 'POST',
+                  body: oauthPayload,
+                });
+              } catch (error) {
+                lastError = error;
+                if (attempt < maxAttempts) {
+                  await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
+                }
+              }
+            }
+            throw lastError;
+          };
+
           try {
-            const dbUser = await callPythonApi<AuthUser>('/api/python/auth/oauth-user', {
-              method: 'POST',
-              body: JSON.stringify({
-                email: user.email,
-                name: user.name,
-                provider: 'google',
-              }),
-            });
+            const dbUser = await persistGoogleUser();
             token.id = String(dbUser.id);
           } catch (error) {
             console.error('Google user persistence error:', error);
-            token.id = account.providerAccountId
-              ? `google:${account.providerAccountId}`
-              : user.email;
+            try {
+              const existing = await callPythonApi<AuthUser | null>(
+                '/api/python/auth/user-by-email',
+                {
+                  method: 'POST',
+                  body: oauthPayload,
+                },
+              );
+              if (existing?.id) {
+                token.id = String(existing.id);
+              } else {
+                token.id = account.providerAccountId
+                  ? `google:${account.providerAccountId}`
+                  : user.email;
+              }
+            } catch (lookupError) {
+              console.error('Google user lookup by email error:', lookupError);
+              token.id = account.providerAccountId
+                ? `google:${account.providerAccountId}`
+                : user.email;
+            }
           }
         }
       }

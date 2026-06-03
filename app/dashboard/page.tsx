@@ -144,6 +144,17 @@ export default function DashboardPage() {
   const [selectedReviewedNetwork, setSelectedReviewedNetwork] = useState<string>('');
   const [graphNetworkName, setGraphNetworkName] = useState<string>('');
   const [isGraphing, setIsGraphing] = useState<boolean>(false);
+  const [resolvedUserId, setResolvedUserId] = useState<number | null>(null);
+  const [isResolvingDbUser, setIsResolvingDbUser] = useState(false);
+
+  const sessionUserId = session?.user?.id ? Number(session.user.id) : NaN;
+  const hasSessionDbUser = Number.isFinite(sessionUserId) && sessionUserId > 0;
+  const effectiveUserId = hasSessionDbUser ? sessionUserId : resolvedUserId;
+  const hasDbUser =
+    effectiveUserId !== null &&
+    Number.isFinite(effectiveUserId) &&
+    effectiveUserId > 0;
+  const reviewedNetworks = networks.filter((n) => n.passReview);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -168,14 +179,60 @@ export default function DashboardPage() {
     }
   }, [status, router]);
 
-  const userId = session?.user?.id ? Number(session.user.id) : NaN;
-  const hasDbUser = Number.isFinite(userId) && userId > 0;
-  const reviewedNetworks = networks.filter((n) => n.passReview);
+  useEffect(() => {
+    if (hasSessionDbUser || !session?.user?.email) {
+      setResolvedUserId(null);
+      return;
+    }
+
+    let cancelled = false;
+    setIsResolvingDbUser(true);
+
+    fetch('/api/python/auth/user-by-email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: session.user.email,
+        name: session.user.name,
+        provider: 'google',
+      }),
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(await apiErrorMessage(response));
+        }
+        return response.json() as Promise<{ id?: number } | null>;
+      })
+      .then((user) => {
+        if (!cancelled && user?.id && user.id > 0) {
+          setResolvedUserId(user.id);
+        }
+      })
+      .catch((error) => {
+        console.error('Error resolving DB user by email:', error);
+        if (!cancelled) {
+          setGenerationError(
+            error instanceof Error
+              ? error.message
+              : '無法依 email 連結 MySQL 使用者',
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsResolvingDbUser(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [hasSessionDbUser, session?.user?.email, session?.user?.name]);
 
   const reloadNetworks = async () => {
-    if (!hasDbUser) return;
+    if (!hasDbUser || effectiveUserId === null) return;
     const networkResponse = await fetch(
-      `/api/python/networks?userId=${encodeURIComponent(String(userId))}&includeGraph=false`
+      `/api/python/networks?userId=${encodeURIComponent(String(effectiveUserId))}&includeGraph=false`
     );
     if (!networkResponse.ok) {
       throw new Error(await apiErrorMessage(networkResponse));
@@ -190,7 +247,7 @@ export default function DashboardPage() {
       console.error('Error loading persisted networks:', error);
       setGenerationError(error instanceof Error ? error.message : 'Failed to load saved networks');
     });
-  }, [hasDbUser, userId]);
+  }, [hasDbUser, effectiveUserId]);
 
   if (status === 'loading') {
     return (
@@ -338,7 +395,7 @@ export default function DashboardPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          userId,
+          userId: effectiveUserId,
           name: networkName.trim(),
           draft: true,
           passReview: false,
@@ -384,7 +441,7 @@ export default function DashboardPage() {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          userId,
+          userId: effectiveUserId,
           draft: true,
           passReview: false,
           nodes: buildNodePayload(validModalNodes.map(editableToNode)),
@@ -492,7 +549,7 @@ export default function DashboardPage() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            userId,
+            userId: effectiveUserId,
             name: randomNetworkName,
             graph: data.graph,
             passReview: true,
@@ -568,7 +625,7 @@ export default function DashboardPage() {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          userId,
+          userId: effectiveUserId,
           passReview: true,
           graph: graphData.graph,
           nodes: buildNodePayload(network.nodes),
@@ -620,7 +677,7 @@ export default function DashboardPage() {
       const response = await fetch(`/api/python/networks/${networkId}/review`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId }),
+        body: JSON.stringify({ userId: effectiveUserId }),
       });
 
       if (!response.ok) {
@@ -688,6 +745,14 @@ export default function DashboardPage() {
             <div className="text-right">
               <p className="text-sm text-gray-400">Login Identity</p>
               <p className="text-white font-medium">{session.user?.email}</p>
+              <p className="text-xs text-gray-500">
+                DB user id:{' '}
+                {hasDbUser
+                  ? effectiveUserId
+                  : isResolvingDbUser
+                    ? '正在連結 MySQL…'
+                    : '未連線 MySQL（無法載入已存網路）'}
+              </p>
             </div>
             <button
               onClick={handleSignOut}
@@ -882,6 +947,13 @@ export default function DashboardPage() {
         {/* Main Content Area */}
         <main className="ml-80 flex-1 p-8">
           <div className="max-w-6xl mx-auto space-y-6">
+            {!hasDbUser && (
+              <div className="rounded-lg border border-amber-500/40 bg-amber-900/30 p-4 text-amber-100 text-sm">
+                目前登入身分尚未對應到 MySQL 數字使用者 ID，無法讀寫已存網路。請確認 Railway 的{' '}
+                <code className="text-amber-200">DATABASE_URL</code> 與 FastAPI 是否正常，並重新登入。
+                本機與線上為<strong>不同資料庫</strong>，在本機建立的 network 不會自動出現在 Railway。
+              </div>
+            )}
             {/* Current Nodes Table */}
             {nodes.length > 0 && (
               <div className="bg-slate-800/50 backdrop-blur-sm rounded-xl p-6 border border-blue-500/30">
