@@ -57,31 +57,14 @@ class NodeInput(BaseModel):
     output: float = 0.0
 
 
-class NodeTableCreateRequest(BaseModel):
-    ownerUserId: str
-    name: str
+class GraphNetworkRequest(BaseModel):
     nodes: List[NodeInput]
 
 
-class NodeTableUpdateRequest(BaseModel):
-    ownerUserId: str
-    name: Optional[str] = None
-    nodes: List[NodeInput]
-
-
-class NodeTableResponse(BaseModel):
-    id: int
-    ownerUserId: str
-    name: str
-    passFlag: bool
-    nodes: List[NodeInput]
-
-
-class ReviewResponse(BaseModel):
+class ValidateNodesResponse(BaseModel):
     success: bool
     passed: bool
     errors: List[str]
-    nodeTable: Optional[NodeTableResponse] = None
 
 
 class NetworkNode(BaseModel):
@@ -98,23 +81,22 @@ class NetworkResponse(BaseModel):
     graph: str
 
 
-class NetworkCreateRequest(BaseModel):
-    ownerUserId: str
-    nodeTableId: int
-    networkName: Optional[str] = None
+class SaveNetworkRequest(BaseModel):
+    userId: int
+    name: str
+    nodes: List[NodeInput]
 
 
 class SavedNetworkResponse(BaseModel):
     """儲存與回傳：簡化欄位 + 還原後的 nodes（供前端表格與繪圖一致）。"""
     id: int
-    ownerUserId: str
+    userId: int
     name: str
     nodeCount: int
     predecessors: List[List[int]]
     meanTimes: List[float]
     nodes: List[NodeInput]
     graph: str
-    nodeTableId: Optional[int] = None
 
 
 def _database_config():
@@ -181,49 +163,21 @@ def init_schema(connection):
         )
         cursor.execute(
             """
-            CREATE TABLE IF NOT EXISTS node_tables (
-                id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                owner_user_id VARCHAR(64) NOT NULL,
-                name VARCHAR(191) NOT NULL,
-                pass_flag BOOLEAN NOT NULL DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY uq_node_tables_owner_name (owner_user_id, name)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS node_table_nodes (
-                id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                node_table_id BIGINT NOT NULL,
-                node_id INT NOT NULL,
-                previous_nodes JSON NOT NULL,
-                mean_time DOUBLE NOT NULL DEFAULT 0,
-                flag BOOLEAN NOT NULL DEFAULT FALSE,
-                output DOUBLE NOT NULL DEFAULT 0,
-                UNIQUE KEY uq_node_table_nodes_table_node (node_table_id, node_id),
-                CONSTRAINT fk_node_table_nodes_table
-                    FOREIGN KEY (node_table_id)
-                    REFERENCES node_tables(id)
-                    ON DELETE CASCADE
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """
-        )
-        cursor.execute(
-            """
             CREATE TABLE IF NOT EXISTS saved_networks (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                owner_user_id VARCHAR(64) NOT NULL,
+                user_id BIGINT NOT NULL,
                 name VARCHAR(191) NOT NULL,
                 node_count INT NOT NULL,
                 predecessors_json JSON NOT NULL,
                 mean_times_json JSON NOT NULL,
                 graph LONGTEXT NOT NULL,
-                source_node_table_id BIGINT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY uq_saved_networks_owner_name (owner_user_id, name)
+                UNIQUE KEY uq_saved_networks_user_name (user_id, name),
+                CONSTRAINT fk_saved_networks_user
+                    FOREIGN KEY (user_id)
+                    REFERENCES users(id)
+                    ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """
         )
@@ -464,72 +418,23 @@ def row_to_saved_network_response(row) -> SavedNetworkResponse:
     mean_times = json.loads(mean_times_raw) if isinstance(mean_times_raw, str) else mean_times_raw
     node_count = int(row["node_count"])
     nodes = node_inputs_from_compact(node_count, predecessors, mean_times)
-    raw_source = row.get("source_node_table_id")
     return SavedNetworkResponse(
         id=row["id"],
-        ownerUserId=str(row["owner_user_id"]),
+        userId=int(row["user_id"]),
         name=row["name"],
         nodeCount=node_count,
         predecessors=predecessors,
         meanTimes=mean_times,
         nodes=nodes,
         graph=row["graph"],
-        nodeTableId=int(raw_source) if raw_source is not None else None,
     )
 
 
-def row_to_node_table(connection, table_row) -> NodeTableResponse:
+def ensure_user_exists(connection, user_id: int):
     with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT node_id, previous_nodes, mean_time, flag, output
-            FROM node_table_nodes
-            WHERE node_table_id = %s
-            ORDER BY node_id ASC
-            """,
-            (table_row["id"],),
-        )
-        node_rows = cursor.fetchall()
-
-    nodes = [
-        NodeInput(
-            id=row["node_id"],
-            previousNodes=json.loads(row["previous_nodes"]),
-            meanTime=float(row["mean_time"]),
-            flag=bool(row["flag"]),
-            output=float(row["output"]),
-        )
-        for row in node_rows
-    ]
-
-    return NodeTableResponse(
-        id=table_row["id"],
-        ownerUserId=str(table_row["owner_user_id"]),
-        name=table_row["name"],
-        passFlag=bool(table_row["pass_flag"]),
-        nodes=nodes,
-    )
-
-
-def save_node_rows(connection, node_table_id: int, nodes: List[NodeInput]):
-    with connection.cursor() as cursor:
-        cursor.execute("DELETE FROM node_table_nodes WHERE node_table_id = %s", (node_table_id,))
-        for pnode in sorted(nodes, key=lambda item: item.id):
-            cursor.execute(
-                """
-                INSERT INTO node_table_nodes
-                    (node_table_id, node_id, previous_nodes, mean_time, flag, output)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    node_table_id,
-                    pnode.id,
-                    json.dumps(pnode.previousNodes),
-                    pnode.meanTime,
-                    pnode.flag,
-                    pnode.output,
-                ),
-            )
+        cursor.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="找不到使用者")
 
 
 def network_graph_to_base64(my_network):
@@ -751,139 +656,35 @@ def get_network(n: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
-@app.post("/api/python/node-tables", response_model=NodeTableResponse)
-def create_node_table(request: NodeTableCreateRequest):
-    name = request.name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Node Table 名稱不可為空")
-
-    with db_connection() as connection:
-        init_schema(connection)
-        with connection.cursor() as cursor:
-            try:
-                cursor.execute(
-                    "INSERT INTO node_tables (owner_user_id, name, pass_flag) VALUES (%s, %s, FALSE)",
-                    (request.ownerUserId, name),
-                )
-            except pymysql.err.IntegrityError:
-                raise HTTPException(status_code=400, detail="同名 Node Table 已存在")
-            node_table_id = cursor.lastrowid
-        save_node_rows(connection, node_table_id, request.nodes)
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM node_tables WHERE id = %s", (node_table_id,))
-            row = cursor.fetchone()
-        response = row_to_node_table(connection, row)
-
-    return response
-
-
-@app.get("/api/python/node-tables", response_model=List[NodeTableResponse])
-def list_node_tables(ownerUserId: str):
-    with db_connection() as connection:
-        init_schema(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM node_tables WHERE owner_user_id = %s ORDER BY updated_at DESC",
-                (ownerUserId,),
-            )
-            rows = cursor.fetchall()
-        return [row_to_node_table(connection, row) for row in rows]
-
-
-@app.put("/api/python/node-tables/{node_table_id}", response_model=NodeTableResponse)
-def update_node_table(node_table_id: int, request: NodeTableUpdateRequest):
-    with db_connection() as connection:
-        init_schema(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM node_tables WHERE id = %s AND owner_user_id = %s",
-                (node_table_id, request.ownerUserId),
-            )
-            row = cursor.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="找不到指定的 Node Table")
-
-            new_name = (request.name or row["name"]).strip()
-            try:
-                cursor.execute(
-                    """
-                    UPDATE node_tables
-                    SET name = %s, pass_flag = FALSE
-                    WHERE id = %s AND owner_user_id = %s
-                    """,
-                    (new_name, node_table_id, request.ownerUserId),
-                )
-            except pymysql.err.IntegrityError:
-                raise HTTPException(status_code=400, detail="同名 Node Table 已存在")
-
-        save_node_rows(connection, node_table_id, request.nodes)
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM node_tables WHERE id = %s", (node_table_id,))
-            updated_row = cursor.fetchone()
-        response = row_to_node_table(connection, updated_row)
-
-    return response
-
-
-@app.post("/api/python/node-tables/{node_table_id}/review", response_model=ReviewResponse)
-def review_node_table(node_table_id: int, ownerUserId: str):
-    with db_connection() as connection:
-        init_schema(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM node_tables WHERE id = %s AND owner_user_id = %s",
-                (node_table_id, ownerUserId),
-            )
-            row = cursor.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="找不到指定的 Node Table")
-
-        node_table = row_to_node_table(connection, row)
-        errors = validate_node_inputs(node_table.nodes)
-
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "UPDATE node_tables SET pass_flag = %s WHERE id = %s",
-                (len(errors) == 0, node_table_id),
-            )
-            cursor.execute("SELECT * FROM node_tables WHERE id = %s", (node_table_id,))
-            updated_row = cursor.fetchone()
-        updated_node_table = row_to_node_table(connection, updated_row)
-
-    return ReviewResponse(
+@app.post("/api/python/validate-nodes", response_model=ValidateNodesResponse)
+def validate_nodes(request: GraphNetworkRequest):
+    errors = validate_node_inputs(request.nodes)
+    return ValidateNodesResponse(
         success=len(errors) == 0,
         passed=len(errors) == 0,
         errors=errors,
-        nodeTable=updated_node_table,
     )
 
 
 @app.post("/api/python/networks/graph", response_model=SavedNetworkResponse)
-def create_network_from_table(request: NetworkCreateRequest):
+def save_network_graph(request: SaveNetworkRequest):
+    network_name = request.name.strip()
+    if not network_name:
+        raise HTTPException(status_code=400, detail="網路名稱不可為空")
+
+    errors = validate_node_inputs(request.nodes)
+    if errors:
+        raise HTTPException(status_code=400, detail={"message": "節點資料驗證失敗", "errors": errors})
+
     with db_connection() as connection:
         init_schema(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM node_tables WHERE id = %s AND owner_user_id = %s",
-                (request.nodeTableId, request.ownerUserId),
-            )
-            table_row = cursor.fetchone()
-            if not table_row:
-                raise HTTPException(status_code=404, detail="找不到指定的 Node Table")
-            if not table_row["pass_flag"]:
-                raise HTTPException(status_code=400, detail="Node Table 尚未通過審查")
+        ensure_user_exists(connection, request.userId)
 
-        node_table = row_to_node_table(connection, table_row)
-        errors = validate_node_inputs(node_table.nodes)
-        if errors:
-            raise HTTPException(status_code=400, detail={"message": "Node Table 驗證失敗", "errors": errors})
-
-        network_name = (request.networkName or node_table.name).strip() or node_table.name
-        network = inputs_to_network(node_table.nodes)
+        network = inputs_to_network(request.nodes)
         graph_base64 = network_graph_to_base64(network)
         graph = f"data:image/png;base64,{graph_base64}"
 
-        node_count, predecessors, mean_times = compact_from_node_inputs(node_table.nodes)
+        node_count, predecessors, mean_times = compact_from_node_inputs(request.nodes)
         predecessors_payload = json.dumps(predecessors)
         mean_times_payload = json.dumps(mean_times)
 
@@ -892,34 +693,32 @@ def create_network_from_table(request: NetworkCreateRequest):
                 cursor.execute(
                     """
                     INSERT INTO saved_networks (
-                        owner_user_id, name, node_count,
-                        predecessors_json, mean_times_json, graph, source_node_table_id
+                        user_id, name, node_count,
+                        predecessors_json, mean_times_json, graph
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
                         node_count = VALUES(node_count),
                         predecessors_json = VALUES(predecessors_json),
                         mean_times_json = VALUES(mean_times_json),
                         graph = VALUES(graph),
-                        source_node_table_id = VALUES(source_node_table_id),
                         updated_at = CURRENT_TIMESTAMP
                     """,
                     (
-                        request.ownerUserId,
+                        request.userId,
                         network_name,
                         node_count,
                         predecessors_payload,
                         mean_times_payload,
                         graph,
-                        request.nodeTableId,
                     ),
                 )
             except pymysql.err.IntegrityError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
 
             cursor.execute(
-                "SELECT * FROM saved_networks WHERE owner_user_id = %s AND name = %s",
-                (request.ownerUserId, network_name),
+                "SELECT * FROM saved_networks WHERE user_id = %s AND name = %s",
+                (request.userId, network_name),
             )
             network_row = cursor.fetchone()
 
@@ -927,21 +726,17 @@ def create_network_from_table(request: NetworkCreateRequest):
 
 
 @app.get("/api/python/networks", response_model=List[SavedNetworkResponse])
-def list_networks(ownerUserId: str):
+def list_networks(userId: int):
     with db_connection() as connection:
         init_schema(connection)
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT * FROM saved_networks WHERE owner_user_id = %s ORDER BY updated_at DESC",
-                (ownerUserId,),
+                "SELECT * FROM saved_networks WHERE user_id = %s ORDER BY updated_at DESC",
+                (userId,),
             )
             rows = cursor.fetchall()
 
     return [row_to_saved_network_response(row) for row in rows]
-
-
-class GraphNetworkRequest(BaseModel):
-    nodes: List[NodeInput]
 
 
 @app.post("/api/python/graph-network", response_model=NetworkResponse)

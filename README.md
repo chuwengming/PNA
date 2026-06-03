@@ -44,20 +44,17 @@ If a database password has appeared in chat or logs, rotate it in Railway (MySQL
 
 The Railway start command runs FastAPI on `127.0.0.1:8000` and Next.js on Railway's public port. Next.js rewrites `/api/python/*` requests to FastAPI through `PYTHON_API_URL`.
 
-## Data Model
+## Data Model (MySQL, 2 tables)
 
-FastAPI initializes these MySQL tables automatically:
+FastAPI initializes these tables on startup (or run `db/schema.sql` on Railway):
 
-- `users` — email/password or OAuth-linked accounts
-- `node_tables` / `node_table_nodes` — editable Node Table workflow (review / graph source)
-- `saved_networks` — **minimal persisted network** per user for redraw and future path logic:
-  - `name` — network name
-  - `node_count` — number of nodes `N`
-  - `predecessors_json` — JSON array of length `N`: each entry is a list of predecessor node IDs for that node index (`[[],[0],…]`)
-  - `mean_times_json` — JSON array of length `N`: mean time per node index
-  - `graph` — cached PNG as `data:image/png;base64,...` for quick display
-  - `source_node_table_id` — optional reference to the Node Table used when saving
+| Table | Purpose |
+|-------|---------|
+| `users` | Login accounts (email / Google OAuth) |
+| `saved_networks` | Persisted networks per user (`user_id` → `users.id`) |
 
-`node_tables` are scoped by the authenticated user's id. Editing a Node Table resets `passFlag` to `false`, so changed tables must pass review again before graph generation.
+**`saved_networks` columns:** `name`, `node_count`, `predecessors_json`, `mean_times_json`, `graph`.
 
-Saved networks are keyed by `(owner_user_id, name)`; saving again with the same name updates the row.
+Node Tables (design / review) live **only in the browser session** until you click **Create Network**, which saves to `saved_networks`.
+
+Manual schema: see `db/schema.sql`.
