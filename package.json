@@ -5,9 +5,9 @@
   "license": "UNLICENSED",
   "scripts": {
     "setup-venv": "python -m venv venv",
-    "install-python": "python -m pip install -r requirements.txt",
-    "fastapi-dev": "npm run install-python && python -m uvicorn api.index:app --reload",
-    "fastapi-start": "python -m uvicorn api.index:app --host 127.0.0.1 --port 8000",
+    "install-python": "node scripts/install-python-deps.mjs",
+    "fastapi-dev": "npm run install-python && node scripts/run-uvicorn.mjs api.index:app --reload",
+    "fastapi-start": "node scripts/run-uvicorn.mjs api.index:app --host 127.0.0.1 --port 8000",
     "next-dev": "next dev",
     "dev": "concurrently \"npm run next-dev\" \"npm run fastapi-dev\"",
     "build": "next build",

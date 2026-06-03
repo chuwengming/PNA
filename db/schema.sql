@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS saved_networks (
   node_count INT NOT NULL,
   predecessors_json JSON NOT NULL COMMENT '長度 N：每個節點的前置節點 ID 列表',
   mean_times_json JSON NOT NULL COMMENT '長度 N：每個節點的 mean time',
+  pass_review TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1=已通過 Review，才可 Graph Network',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uq_saved_networks_user_name (user_id, name),
@@ -30,6 +31,3 @@ CREATE TABLE IF NOT EXISTS saved_networks (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 SET FOREIGN_KEY_CHECKS = 1;
-
--- 若資料表已存在且仍有 graph 欄位，可執行：
--- ALTER TABLE saved_networks DROP COLUMN graph;

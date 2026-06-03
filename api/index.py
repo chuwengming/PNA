@@ -102,6 +102,21 @@ class SaveNetworkRequest(BaseModel):
     userId: int
     name: str
     nodes: List[NodeInput]
+    graph: Optional[str] = None
+    passReview: bool = False
+    draft: bool = False
+
+
+class UpdateNetworkRequest(BaseModel):
+    userId: int
+    nodes: List[NodeInput]
+    graph: Optional[str] = None
+    passReview: Optional[bool] = None
+    draft: bool = False
+
+
+class ReviewNetworkRequest(BaseModel):
+    userId: int
 
 
 class SavedNetworkResponse(BaseModel):
@@ -114,6 +129,7 @@ class SavedNetworkResponse(BaseModel):
     meanTimes: List[float]
     nodes: List[NodeInput]
     graph: str
+    passReview: bool
 
 
 def _database_config():
@@ -187,6 +203,7 @@ def init_schema(connection):
                 node_count INT NOT NULL,
                 predecessors_json JSON NOT NULL,
                 mean_times_json JSON NOT NULL,
+                pass_review TINYINT(1) NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 UNIQUE KEY uq_saved_networks_user_name (user_id, name),
@@ -200,7 +217,7 @@ def init_schema(connection):
 
 
 def migrate_schema(connection):
-    """移除舊版 saved_networks.graph 欄位（若存在）。"""
+    """資料表遷移：移除 graph 欄位、補上 pass_review。"""
     with connection.cursor() as cursor:
         cursor.execute(
             """
@@ -213,6 +230,20 @@ def migrate_schema(connection):
         row = cursor.fetchone()
         if row and row["cnt"]:
             cursor.execute("ALTER TABLE saved_networks DROP COLUMN graph")
+
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'saved_networks'
+              AND COLUMN_NAME = 'pass_review'
+            """
+        )
+        row = cursor.fetchone()
+        if row and not row["cnt"]:
+            cursor.execute(
+                "ALTER TABLE saved_networks ADD COLUMN pass_review TINYINT(1) NOT NULL DEFAULT 0"
+            )
 
 
 @app.on_event("startup")
@@ -365,6 +396,14 @@ def validate_node_inputs(nodes: List[NodeInput]) -> List[str]:
     return errors
 
 
+def validate_draft_nodes(nodes: List[NodeInput]) -> List[str]:
+    if not nodes:
+        return ["至少需要一個節點。"]
+    if len(nodes) > 50:
+        return ["節點數量不能超過 50。"]
+    return []
+
+
 def has_cycle(nodes: List[NodeInput]) -> bool:
     graph = {pnode.id: [] for pnode in nodes}
     for pnode in nodes:
@@ -444,15 +483,23 @@ def node_inputs_from_compact(
     ]
 
 
-def row_to_saved_network_response(row) -> SavedNetworkResponse:
+def row_to_saved_network_response(
+    row,
+    graph_uri: Optional[str] = None,
+    include_graph: bool = True,
+) -> SavedNetworkResponse:
     predecessors_raw = row["predecessors_json"]
     mean_times_raw = row["mean_times_json"]
     predecessors = json.loads(predecessors_raw) if isinstance(predecessors_raw, str) else predecessors_raw
     mean_times = json.loads(mean_times_raw) if isinstance(mean_times_raw, str) else mean_times_raw
     node_count = int(row["node_count"])
     nodes = node_inputs_from_compact(node_count, predecessors, mean_times)
-    network = inputs_to_network(nodes)
-    graph_uri = f"data:image/png;base64,{network_graph_to_base64(network)}"
+    if include_graph:
+        if not graph_uri:
+            network = inputs_to_network(nodes)
+            graph_uri = f"data:image/png;base64,{network_graph_to_base64(network)}"
+    else:
+        graph_uri = graph_uri or ""
     return SavedNetworkResponse(
         id=row["id"],
         userId=int(row["user_id"]),
@@ -462,7 +509,92 @@ def row_to_saved_network_response(row) -> SavedNetworkResponse:
         meanTimes=mean_times,
         nodes=nodes,
         graph=graph_uri,
+        passReview=bool(row.get("pass_review", 0)),
     )
+
+
+def fetch_network_row(connection, network_id: int, user_id: int):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT * FROM saved_networks WHERE id = %s AND user_id = %s",
+            (network_id, user_id),
+        )
+        row = cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="找不到網路")
+    return row
+
+
+def persist_network_nodes(
+    connection,
+    user_id: int,
+    network_name: str,
+    nodes: List[NodeInput],
+    pass_review: bool,
+    network_id: Optional[int] = None,
+) -> dict:
+    node_count, predecessors, mean_times = compact_from_node_inputs(nodes)
+    predecessors_payload = json.dumps(predecessors)
+    mean_times_payload = json.dumps(mean_times)
+    pass_review_value = 1 if pass_review else 0
+
+    with connection.cursor() as cursor:
+        if network_id is not None:
+            cursor.execute(
+                """
+                UPDATE saved_networks
+                SET node_count = %s,
+                    predecessors_json = %s,
+                    mean_times_json = %s,
+                    pass_review = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND user_id = %s
+                """,
+                (
+                    node_count,
+                    predecessors_payload,
+                    mean_times_payload,
+                    pass_review_value,
+                    network_id,
+                    user_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="找不到網路")
+            return fetch_network_row(connection, network_id, user_id)
+
+        try:
+            cursor.execute(
+                """
+                INSERT INTO saved_networks (
+                    user_id, name, node_count,
+                    predecessors_json, mean_times_json, pass_review
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    node_count = VALUES(node_count),
+                    predecessors_json = VALUES(predecessors_json),
+                    mean_times_json = VALUES(mean_times_json),
+                    pass_review = VALUES(pass_review),
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    user_id,
+                    network_name,
+                    node_count,
+                    predecessors_payload,
+                    mean_times_payload,
+                    pass_review_value,
+                ),
+            )
+        except pymysql.err.IntegrityError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        cursor.execute(
+            "SELECT * FROM saved_networks WHERE user_id = %s AND name = %s",
+            (user_id, network_name),
+        )
+        return cursor.fetchone()
 
 
 def ensure_user_exists(connection, user_id: int):
@@ -569,7 +701,8 @@ def network_graph_to_base64(my_network):
     buf.seek(0)
     img_base64 = base64.b64encode(buf.read()).decode('utf-8')
     plt.close(fig)
-    
+    plt.close('all')
+
     return img_base64
 
 
@@ -707,57 +840,104 @@ def save_network_graph(request: SaveNetworkRequest):
     if not network_name:
         raise HTTPException(status_code=400, detail="網路名稱不可為空")
 
-    errors = validate_node_inputs(request.nodes)
+    if request.draft:
+        errors = validate_draft_nodes(request.nodes)
+    else:
+        errors = validate_node_inputs(request.nodes)
     if errors:
         raise HTTPException(status_code=400, detail={"message": "節點資料驗證失敗", "errors": errors})
 
     with db_connection() as connection:
         init_schema(connection)
+        migrate_schema(connection)
         ensure_user_exists(connection, request.userId)
+        network_row = persist_network_nodes(
+            connection,
+            request.userId,
+            network_name,
+            request.nodes,
+            pass_review=request.passReview and not request.draft,
+        )
 
-        node_count, predecessors, mean_times = compact_from_node_inputs(request.nodes)
-        predecessors_payload = json.dumps(predecessors)
-        mean_times_payload = json.dumps(mean_times)
+    return row_to_saved_network_response(
+        network_row,
+        request.graph,
+        include_graph=request.graph is not None,
+    )
+
+
+@app.put("/api/python/networks/{network_id}", response_model=SavedNetworkResponse)
+def update_network(network_id: int, request: UpdateNetworkRequest):
+    if request.draft:
+        errors = validate_draft_nodes(request.nodes)
+    else:
+        errors = validate_node_inputs(request.nodes)
+    if errors:
+        raise HTTPException(status_code=400, detail={"message": "節點資料驗證失敗", "errors": errors})
+
+    pass_review = False if request.passReview is None else request.passReview
+    if request.draft:
+        pass_review = False
+
+    with db_connection() as connection:
+        init_schema(connection)
+        migrate_schema(connection)
+        ensure_user_exists(connection, request.userId)
+        fetch_network_row(connection, network_id, request.userId)
+        network_row = persist_network_nodes(
+            connection,
+            request.userId,
+            "",
+            request.nodes,
+            pass_review=pass_review,
+            network_id=network_id,
+        )
+
+    return row_to_saved_network_response(
+        network_row,
+        request.graph,
+        include_graph=request.graph is not None,
+    )
+
+
+@app.post("/api/python/networks/{network_id}/review", response_model=SavedNetworkResponse)
+def review_network(network_id: int, request: ReviewNetworkRequest):
+    with db_connection() as connection:
+        init_schema(connection)
+        migrate_schema(connection)
+        ensure_user_exists(connection, request.userId)
+        row = fetch_network_row(connection, network_id, request.userId)
+        predecessors = json.loads(row["predecessors_json"]) if isinstance(row["predecessors_json"], str) else row["predecessors_json"]
+        mean_times = json.loads(row["mean_times_json"]) if isinstance(row["mean_times_json"], str) else row["mean_times_json"]
+        nodes = node_inputs_from_compact(int(row["node_count"]), predecessors, mean_times)
+
+        errors = validate_node_inputs(nodes)
+        if errors:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE saved_networks SET pass_review = 0 WHERE id = %s AND user_id = %s",
+                    (network_id, request.userId),
+                )
+            raise HTTPException(
+                status_code=400,
+                detail={"message": "審查未通過", "errors": errors},
+            )
 
         with connection.cursor() as cursor:
-            try:
-                cursor.execute(
-                    """
-                    INSERT INTO saved_networks (
-                        user_id, name, node_count,
-                        predecessors_json, mean_times_json
-                    )
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        node_count = VALUES(node_count),
-                        predecessors_json = VALUES(predecessors_json),
-                        mean_times_json = VALUES(mean_times_json),
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    (
-                        request.userId,
-                        network_name,
-                        node_count,
-                        predecessors_payload,
-                        mean_times_payload,
-                    ),
-                )
-            except pymysql.err.IntegrityError as exc:
-                raise HTTPException(status_code=400, detail=str(exc))
-
             cursor.execute(
-                "SELECT * FROM saved_networks WHERE user_id = %s AND name = %s",
-                (request.userId, network_name),
+                "UPDATE saved_networks SET pass_review = 1, updated_at = CURRENT_TIMESTAMP WHERE id = %s AND user_id = %s",
+                (network_id, request.userId),
             )
-            network_row = cursor.fetchone()
+        row = fetch_network_row(connection, network_id, request.userId)
 
-    return row_to_saved_network_response(network_row)
+    return row_to_saved_network_response(row, include_graph=False)
 
 
 @app.get("/api/python/networks", response_model=List[SavedNetworkResponse])
-def list_networks(userId: int):
+def list_networks(userId: int, includeGraph: bool = False):
     with db_connection() as connection:
         init_schema(connection)
+        migrate_schema(connection)
         with connection.cursor() as cursor:
             cursor.execute(
                 "SELECT * FROM saved_networks WHERE user_id = %s ORDER BY updated_at DESC",
@@ -765,7 +945,10 @@ def list_networks(userId: int):
             )
             rows = cursor.fetchall()
 
-    return [row_to_saved_network_response(row) for row in rows]
+    return [
+        row_to_saved_network_response(row, include_graph=includeGraph)
+        for row in rows
+    ]
 
 
 @app.post("/api/python/graph-network", response_model=NetworkResponse)

@@ -1,4 +1,4 @@
-# 本機啟動：啟用 Python venv → 載入環境變數 → npm run dev
+# 本機啟動：載入環境變數 → npm run dev（venv 由 npm 腳本使用，不啟用終端機 venv）
 # 用法：在專案根目錄執行  powershell -ExecutionPolicy Bypass -File scripts/start-dev.ps1
 
 $ErrorActionPreference = 'Stop'
@@ -6,24 +6,6 @@ $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location $ProjectRoot
 
 Write-Host "==> Project: $ProjectRoot"
-
-$venvCandidates = @(
-    (Join-Path $ProjectRoot 'venv\Scripts\Activate.ps1'),
-    (Join-Path $ProjectRoot 'pna-src\venv\Scripts\Activate.ps1')
-)
-$venvActivate = $venvCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-if (-not $venvActivate) {
-    Write-Host '==> No venv found. Creating venv and installing Python deps...'
-    python -m venv (Join-Path $ProjectRoot 'venv')
-    $venvActivate = Join-Path $ProjectRoot 'venv\Scripts\Activate.ps1'
-}
-
-Write-Host "==> Activating venv: $venvActivate"
-. $venvActivate
-
-Write-Host '==> Installing Python requirements (if needed)...'
-python -m pip install -q -r requirements.txt
 
 $loadDotEnv = Join-Path $PSScriptRoot 'load-dotenv.ps1'
 if (Test-Path (Join-Path $ProjectRoot '.env')) {

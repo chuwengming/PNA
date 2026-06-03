@@ -23,7 +23,7 @@ interface EditableNode {
   output: number;
 }
 
-// 定義網路型別
+// 定義網路型別（對應 saved_networks）
 interface Network {
   id: number;
   userId?: number;
@@ -33,14 +33,7 @@ interface Network {
   meanTimes?: number[];
   nodes: Node[];
   graph: string;
-}
-
-// Node Table 僅存在瀏覽器工作階段（不寫入資料庫）
-interface NodeTable {
-  id: number;
-  name: string;
-  nodes: Node[];
-  passFlag: boolean;
+  passReview: boolean;
 }
 
 // 定義表單型別
@@ -120,12 +113,12 @@ export default function DashboardPage() {
   const [currentNodeId, setCurrentNodeId] = useState<number>(0);
   const [modalNodes, setModalNodes] = useState<EditableNode[]>([]);
   
-  // 網路資料
+  // 網路資料（MySQL saved_networks）
   const [networks, setNetworks] = useState<Network[]>([]);
-  const [nodeTables, setNodeTables] = useState<NodeTable[]>([]);
   const [selectedNetwork, setSelectedNetwork] = useState<string>('');
-  const [selectedNodeTable, setSelectedNodeTable] = useState<string>('');
-  const [selectedNodeTableForReview, setSelectedNodeTableForReview] = useState<string>('');
+  const [selectedNetworkForEdit, setSelectedNetworkForEdit] = useState<string>('');
+  const [editingNetworkId, setEditingNetworkId] = useState<number | null>(null);
+  const [selectedNetworkForReview, setSelectedNetworkForReview] = useState<string>('');
   const [reviewErrors, setReviewErrors] = useState<string[]>([]);
   const [isEditingTable, setIsEditingTable] = useState<boolean>(false);
   const [networkName, setNetworkName] = useState<string>('');
@@ -148,7 +141,7 @@ export default function DashboardPage() {
 
   // Graph Network Modal
   const [showGraphNetworkModal, setShowGraphNetworkModal] = useState<boolean>(false);
-  const [selectedPassedTable, setSelectedPassedTable] = useState<string>('');
+  const [selectedReviewedNetwork, setSelectedReviewedNetwork] = useState<string>('');
   const [graphNetworkName, setGraphNetworkName] = useState<string>('');
   const [isGraphing, setIsGraphing] = useState<boolean>(false);
 
@@ -177,29 +170,26 @@ export default function DashboardPage() {
 
   const userId = session?.user?.id ? Number(session.user.id) : NaN;
   const hasDbUser = Number.isFinite(userId) && userId > 0;
+  const reviewedNetworks = networks.filter((n) => n.passReview);
+
+  const reloadNetworks = async () => {
+    if (!hasDbUser) return;
+    const networkResponse = await fetch(
+      `/api/python/networks?userId=${encodeURIComponent(String(userId))}&includeGraph=false`
+    );
+    if (!networkResponse.ok) {
+      throw new Error(await apiErrorMessage(networkResponse));
+    }
+    const persistedNetworks: Network[] = await networkResponse.json();
+    setNetworks(persistedNetworks);
+  };
 
   useEffect(() => {
     if (!hasDbUser) return;
-
-    const loadPersistedNetworks = async () => {
-      try {
-        const networkResponse = await fetch(
-          `/api/python/networks?userId=${encodeURIComponent(String(userId))}`
-        );
-
-        if (!networkResponse.ok) {
-          throw new Error(await apiErrorMessage(networkResponse));
-        }
-
-        const persistedNetworks: Network[] = await networkResponse.json();
-        setNetworks(persistedNetworks);
-      } catch (error) {
-        console.error('Error loading persisted networks:', error);
-        setGenerationError(error instanceof Error ? error.message : 'Failed to load saved networks');
-      }
-    };
-
-    loadPersistedNetworks();
+    reloadNetworks().catch((error) => {
+      console.error('Error loading persisted networks:', error);
+      setGenerationError(error instanceof Error ? error.message : 'Failed to load saved networks');
+    });
   }, [hasDbUser, userId]);
 
   if (status === 'loading') {
@@ -267,77 +257,185 @@ export default function DashboardPage() {
     setModalNodes(newModalNodes);
   };
 
-  // 儲存節點參數資料表（僅本機工作階段）
-  const handleSaveNodeTable = () => {
-  if (!networkName.trim()) {
-    alert('Please enter a table name.');
-    return;
-  }
+  // 刪除節點行並重新編號 ID，同步調整 previousNodes 參照
+  const deleteModalNodeRow = (index: number) => {
+    if (modalNodes.length <= 1) {
+      alert('至少需要保留一個節點。');
+      return;
+    }
+    if (index === 0) {
+      alert('無法刪除起始節點（ID 0）。');
+      return;
+    }
 
-  const validModalNodes = modalNodes.filter((n, index) => {
-    if (index === 0) return true;
-    return n.previousNodes.trim() !== '' || n.meanTime.trim() !== '';
-  });
+    const deletedId = index;
+    const remapped = modalNodes
+      .filter((_, i) => i !== index)
+      .map((node, newId) => {
+        const predecessors = node.previousNodes.trim() === ''
+          ? []
+          : node.previousNodes
+              .split(',')
+              .map((value) => parseInt(value.trim(), 10))
+              .filter((value) => !Number.isNaN(value));
 
-  if (validModalNodes.length === 0) {
-    alert('Please add at least one valid node.');
-    return;
-  }
+        const adjusted = predecessors
+          .filter((id) => id !== deletedId)
+          .map((id) => (id > deletedId ? id - 1 : id));
 
-  const newNodeTable: NodeTable = {
-    id: Date.now(),
-    name: networkName.trim(),
-    nodes: validModalNodes.map(editableToNode),
-    passFlag: false,
+        return {
+          ...node,
+          id: newId,
+          previousNodes: adjusted.join(', '),
+        };
+      });
+
+    setModalNodes(remapped);
   };
-  setNodeTables(prevNodeTables => [newNodeTable, ...prevNodeTables]);
-  setNetworkName('');
-  setShowNetworkNameModal(false);
-  setShowAddNodeModal(false);
-  alert(`Node Table "${newNodeTable.name}" saved in this session.`);
-};
 
-  // 更新節點參數資料表（僅本機工作階段）
-  const handleUpdateNodeTable = () => {
-  const tableIndex = nodeTables.findIndex(t => String(t.id) === selectedNodeTable);
-  if (tableIndex === -1) {
-    alert('Could not find the selected table to update.');
-    return;
-  }
+  const buildNodePayload = (sourceNodes: Node[]) =>
+    sourceNodes.map((n) => ({
+      id: n.id,
+      previousNodes: n.previousNodes,
+      meanTime: n.meanTime,
+      flag: n.flag,
+      output: n.output,
+    }));
 
-  const validModalNodes = modalNodes.filter((n, index) => {
-    if (index === 0) return true;
-    return n.previousNodes.trim() !== '' || n.meanTime.trim() !== '';
-  });
-  
-  if (validModalNodes.length === 0) {
-    alert('A node table cannot be empty.');
-    return;
-  }
+  const filterValidModalNodes = () =>
+    modalNodes.filter((n, index) => {
+      if (index === 0) return true;
+      return n.previousNodes.trim() !== '' || n.meanTime.trim() !== '';
+    });
 
-  const selectedTable = nodeTables[tableIndex];
-  const updatedNodeTable: NodeTable = {
-    ...selectedTable,
-    nodes: validModalNodes.map(editableToNode),
-    passFlag: false,
+  const upsertNetworkInState = (saved: Network) => {
+    setNetworks((prev) => {
+      const idx = prev.findIndex((n) => n.id === saved.id);
+      if (idx === -1) return [saved, ...prev];
+      return prev.map((n) => (n.id === saved.id ? saved : n));
+    });
   };
-  setNodeTables(prevNodeTables =>
-    prevNodeTables.map(table => table.id === updatedNodeTable.id ? updatedNodeTable : table)
-  );
-  setShowEditNodeModal(false);
-  setIsEditingTable(false);
-  setSelectedNodeTable('');
-  alert(`Node Table "${updatedNodeTable.name}" updated. Please review again before graphing.`);
-};
 
-  // 選擇網路
-  const handleSelectNetwork = (networkId: string) => {
+  // 儲存至 MySQL（草稿，尚未 Review）
+  const handleSaveNetwork = async () => {
+    if (!networkName.trim()) {
+      alert('Please enter a network name.');
+      return;
+    }
+    if (!hasDbUser) {
+      alert('Please sign in with a database-backed account before saving networks.');
+      return;
+    }
+
+    const validModalNodes = filterValidModalNodes();
+    if (validModalNodes.length === 0) {
+      alert('Please add at least one valid node.');
+      return;
+    }
+
+    try {
+      const response = await fetch('/api/python/networks/graph', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId,
+          name: networkName.trim(),
+          draft: true,
+          passReview: false,
+          nodes: buildNodePayload(validModalNodes.map(editableToNode)),
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(await apiErrorMessage(response));
+      }
+
+      const saved: Network = await response.json();
+      upsertNetworkInState(saved);
+      setNetworkName('');
+      setShowNetworkNameModal(false);
+      setShowAddNodeModal(false);
+      alert(`Network "${saved.name}" saved. Run Review Network before graphing.`);
+    } catch (error) {
+      console.error('Error saving network:', error);
+      alert(error instanceof Error ? error.message : 'Failed to save network.');
+    }
+  };
+
+  // 更新已儲存網路（編輯後需重新 Review）
+  const handleUpdateNetwork = async () => {
+    if (editingNetworkId === null) {
+      alert('No network selected for update.');
+      return;
+    }
+    if (!hasDbUser) {
+      alert('Please sign in with a database-backed account.');
+      return;
+    }
+
+    const validModalNodes = filterValidModalNodes();
+    if (validModalNodes.length === 0) {
+      alert('A network cannot be empty.');
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/python/networks/${editingNetworkId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId,
+          draft: true,
+          passReview: false,
+          nodes: buildNodePayload(validModalNodes.map(editableToNode)),
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(await apiErrorMessage(response));
+      }
+
+      const saved: Network = await response.json();
+      upsertNetworkInState(saved);
+      setShowEditNodeModal(false);
+      setIsEditingTable(false);
+      setSelectedNetworkForEdit('');
+      setEditingNetworkId(null);
+      alert(`Network "${saved.name}" updated. Please run Review Network again before graphing.`);
+    } catch (error) {
+      console.error('Error updating network:', error);
+      alert(error instanceof Error ? error.message : 'Failed to update network.');
+    }
+  };
+
+  // 選擇網路（分析區顯示）
+  const handleSelectNetwork = async (networkId: string) => {
     setSelectedNetwork(networkId);
-    const network = networks.find(n => String(n.id) === networkId);
-    if (network) {
-      setNodes([...network.nodes]);
-      setCurrentNodeId(network.nodes.length);
+    const network = reviewedNetworks.find((n) => String(n.id) === networkId);
+    if (!network) return;
+
+    setNodes([...network.nodes]);
+    setCurrentNodeId(network.nodes.length);
+
+    if (network.graph) {
       setNetworkGraph(network.graph);
+      return;
+    }
+
+    try {
+      const graphResponse = await fetch('/api/python/graph-network', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nodes: buildNodePayload(network.nodes) }),
+      });
+      if (!graphResponse.ok) {
+        throw new Error(await apiErrorMessage(graphResponse));
+      }
+      const graphData: NetworkGenerationResponse = await graphResponse.json();
+      setNetworkGraph(graphData.graph);
+    } catch (error) {
+      console.error('Error loading network graph:', error);
+      setNetworkGraph('');
     }
   };
 
@@ -382,25 +480,10 @@ export default function DashboardPage() {
       const data: NetworkGenerationResponse = await response.json();
       
       if (data.success) {
-        // 轉換節點資料格式 for display
         const convertedNodes: Node[] = data.nodes.map(node => ({
           id: node.id,
           previousNodes: node.pre_node,
           meanTime: node.mean_val,
-          flag: node.flag,
-          output: node.output
-        }));
-        setNodes(convertedNodes);
-        setCurrentNodeId(convertedNodes.length);
-        
-        // 更新網路圖形
-        setNetworkGraph(data.graph);
-
-        // Create and save NodeTable
-        const editableNodes: EditableNode[] = data.nodes.map(node => ({
-          id: node.id,
-          previousNodes: node.pre_node.join(', '),
-          meanTime: String(node.mean_val),
           flag: node.flag,
           output: node.output
         }));
@@ -411,13 +494,9 @@ export default function DashboardPage() {
           body: JSON.stringify({
             userId,
             name: randomNetworkName,
-            nodes: convertedNodes.map(n => ({
-              id: n.id,
-              previousNodes: n.previousNodes,
-              meanTime: n.meanTime,
-              flag: n.flag,
-              output: n.output,
-            })),
+            graph: data.graph,
+            passReview: true,
+            nodes: buildNodePayload(convertedNodes),
           }),
         });
 
@@ -426,19 +505,11 @@ export default function DashboardPage() {
         }
 
         const savedNetwork: Network = await saveResponse.json();
-        setNetworks(prev => {
-          const idx = prev.findIndex(n => n.id === savedNetwork.id);
-          if (idx === -1) return [savedNetwork, ...prev];
-          return prev.map(n => (n.id === savedNetwork.id ? savedNetwork : n));
-        });
 
-        const newNodeTable: NodeTable = {
-          id: Date.now(),
-          name: randomNetworkName,
-          nodes: convertedNodes,
-          passFlag: true,
-        };
-        setNodeTables(prevNodeTables => [newNodeTable, ...prevNodeTables]);
+        setNodes(convertedNodes);
+        setCurrentNodeId(convertedNodes.length);
+        setNetworkGraph(savedNetwork.graph || data.graph);
+        upsertNetworkInState({ ...savedNetwork, graph: savedNetwork.graph || data.graph, passReview: true });
         
         alert(`Successfully generated and saved network "${randomNetworkName}" with ${nodeCount} nodes!`);
       } else {
@@ -458,8 +529,8 @@ export default function DashboardPage() {
 
   // Graph Network Generation
   const handleGraphNetwork = async () => {
-    if (!selectedPassedTable) {
-      alert('Please select a node table.');
+    if (!selectedReviewedNetwork) {
+      alert('Please select a network.');
       return;
     }
     if (!hasDbUser) {
@@ -467,37 +538,40 @@ export default function DashboardPage() {
       return;
     }
 
-    const table = nodeTables.find(t => String(t.id) === selectedPassedTable);
-    if (!table) {
-      alert('Selected table not found.');
+    const network = networks.find((n) => String(n.id) === selectedReviewedNetwork);
+    if (!network) {
+      alert('Selected network not found.');
       return;
     }
-    if (!table.passFlag) {
-      alert('Please review and pass the node table before creating a network.');
+    if (!network.passReview) {
+      alert('Please review and pass the network before graphing.');
       return;
     }
 
-    const networkName = graphNetworkName.trim() || table.name;
-    
     setIsGraphing(true);
     setShowGraphNetworkModal(false);
     
     try {
-      const response = await fetch('/api/python/networks/graph', {
+      const graphResponse = await fetch('/api/python/graph-network', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nodes: buildNodePayload(network.nodes) }),
+      });
+
+      if (!graphResponse.ok) {
+        throw new Error(await apiErrorMessage(graphResponse));
+      }
+
+      const graphData: NetworkGenerationResponse = await graphResponse.json();
+
+      const response = await fetch(`/api/python/networks/${network.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           userId,
-          name: networkName,
-          nodes: table.nodes.map(n => ({
-            id: n.id,
-            previousNodes: n.previousNodes,
-            meanTime: n.meanTime,
-            flag: n.flag,
-            output: n.output,
-          })),
+          passReview: true,
+          graph: graphData.graph,
+          nodes: buildNodePayload(network.nodes),
         }),
       });
       
@@ -509,14 +583,10 @@ export default function DashboardPage() {
       
       setNodes(data.nodes);
       setCurrentNodeId(data.nodes.length);
-      setNetworkGraph(data.graph);
-      setNetworks(prevNetworks => {
-        const existingIndex = prevNetworks.findIndex(network => network.id === data.id);
-        if (existingIndex === -1) return [data, ...prevNetworks];
-        return prevNetworks.map(network => network.id === data.id ? data : network);
-      });
+      setNetworkGraph(graphData.graph);
+      upsertNetworkInState({ ...data, graph: graphData.graph, passReview: true });
       
-      alert(`Successfully created network "${networkName}"!`);
+      alert(`Successfully graphed network "${network.name}"!`);
       
     } catch (error) {
       console.error('Error graphing network:', error);
@@ -524,62 +594,55 @@ export default function DashboardPage() {
       alert('Failed to create network graph. Please try again.');
     } finally {
       setIsGraphing(false);
-      setSelectedPassedTable('');
+      setSelectedReviewedNetwork('');
       setGraphNetworkName('');
     }
   };
 
-  // 審查節點參數資料表
-  const handleReviewNodeTable = async () => {
-    const table = nodeTables.find(t => String(t.id) === selectedNodeTableForReview);
-    if (!table) {
-      alert('Selected node table not found.');
+  const handleReviewNetwork = async () => {
+    if (!selectedNetworkForReview) {
+      alert('Please select a network to review.');
+      return;
+    }
+    if (!hasDbUser) {
+      alert('Please sign in with a database-backed account.');
+      return;
+    }
+
+    const networkId = Number(selectedNetworkForReview);
+    const network = networks.find((n) => n.id === networkId);
+    if (!network) {
+      alert('Selected network not found.');
       return;
     }
 
     try {
-      const response = await fetch('/api/python/validate-nodes', {
+      const response = await fetch(`/api/python/networks/${networkId}/review`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          nodes: table.nodes.map(n => ({
-            id: n.id,
-            previousNodes: n.previousNodes,
-            meanTime: n.meanTime,
-            flag: n.flag,
-            output: n.output,
-          })),
-        }),
+        body: JSON.stringify({ userId }),
       });
 
       if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        const detail = payload?.detail;
+        if (detail?.errors) {
+          setReviewErrors(detail.errors);
+          setShowReviewErrorsModal(true);
+          upsertNetworkInState({ ...network, passReview: false });
+          return;
+        }
         throw new Error(await apiErrorMessage(response));
       }
 
-      const review: ValidateNodesResponse = await response.json();
-
-      if (!review.passed) {
-        setReviewErrors(review.errors);
-        setShowReviewErrorsModal(true);
-        setNodeTables(prevNodeTables =>
-          prevNodeTables.map(nodeTable =>
-            nodeTable.id === table.id ? { ...nodeTable, passFlag: false } : nodeTable
-          )
-        );
-        return;
-      }
-
-      setNodeTables(prevNodeTables =>
-        prevNodeTables.map(nodeTable =>
-          nodeTable.id === table.id ? { ...nodeTable, passFlag: true } : nodeTable
-        )
-      );
-      alert(`Node Table "${table.name}" has passed the review!`);
+      const reviewed: Network = await response.json();
+      upsertNetworkInState({ ...reviewed, passReview: true });
+      alert(`Network "${network.name}" has passed the review!`);
       setShowReviewNodeModal(false);
-      setSelectedNodeTableForReview('');
+      setSelectedNetworkForReview('');
     } catch (error) {
-      console.error('Error reviewing node table:', error);
-      alert(error instanceof Error ? error.message : 'Failed to review node table.');
+      console.error('Error reviewing network:', error);
+      alert(error instanceof Error ? error.message : 'Failed to review network.');
     }
   };
 
@@ -655,21 +718,21 @@ export default function DashboardPage() {
                   <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
                   </svg>
-                  Create Node Table
+                  Create Network
                 </button>
                 <button
                   onClick={() => {
                     clearDisplayAreas();
                     setShowEditNodeModal(true);
                     setIsEditingTable(false);
-                    setSelectedNodeTable('');
+                    setSelectedNetworkForEdit('');
                   }}
                   className="w-full px-4 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium text-sm flex items-center justify-center"
                 >
                   <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
                   </svg>
-                  Edit Node Table
+                  Edit Network
                 </button>
                 <button
                   onClick={() => setShowGenerateModal(true)}
@@ -707,20 +770,20 @@ export default function DashboardPage() {
                   onClick={() => {
                     clearDisplayAreas();
                     setShowReviewNodeModal(true);
-                    setSelectedNodeTableForReview('');
+                    setSelectedNetworkForReview('');
                   }}
                   className="w-full px-4 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium text-sm flex items-center justify-center"
                 >
                   <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
                   </svg>
-                  Review Node Table
+                  Review Network
                 </button>
                 <button
                   onClick={() => {
                     clearDisplayAreas();
                     setShowGraphNetworkModal(true);
-                    setSelectedPassedTable('');
+                    setSelectedReviewedNetwork('');
                     setGraphNetworkName('');
                   }}
                   disabled={isGraphing}
@@ -763,14 +826,16 @@ export default function DashboardPage() {
                     className="w-full px-4 py-3 bg-slate-900 border border-blue-500/30 rounded-lg text-white focus:outline-none focus:border-cyan-400 text-sm"
                   >
                     <option value="">Select Network...</option>
-                    {networks.map((network) => (
+                    {reviewedNetworks.map((network) => (
                       <option key={network.id} value={network.id}>
                         {network.name}
                       </option>
                     ))}
                   </select>
                   <p className="text-xs text-gray-500 mt-1">
-                    There are {networks.length} networks available
+                    {reviewedNetworks.length === 0
+                      ? 'No reviewed networks yet. Complete Review Network first.'
+                      : `${reviewedNetworks.length} reviewed network(s) available for analysis`}
                   </p>
                 </div>
                 <button
@@ -824,7 +889,7 @@ export default function DashboardPage() {
                   <svg className="w-6 h-6 mr-2 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
                   </svg>
-                  Node Table Visualization
+                  Network Visualization
                 </h2>
                 <div className="overflow-x-auto">
                   <table className="w-full text-left">
@@ -917,7 +982,7 @@ export default function DashboardPage() {
       {showAddNodeModal && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <div className="bg-slate-800 rounded-2xl p-8 max-w-4xl w-full border border-blue-500/30 shadow-2xl flex flex-col max-h-[90vh]">
-            <h3 className="text-2xl font-bold text-white mb-6">Add New Nodes</h3>
+            <h3 className="text-2xl font-bold text-white mb-6">Create Network — Add Nodes</h3>
             <div className="flex-grow overflow-y-auto pr-2">
               <table className="w-full text-left table-fixed">
                 <thead className="sticky top-0 bg-slate-800">
@@ -927,7 +992,7 @@ export default function DashboardPage() {
                     <th className="py-3 px-2 w-32 text-cyan-400 font-semibold text-sm">Mean Time</th>
                     <th className="py-3 px-2 w-24 text-cyan-400 font-semibold text-sm">Flag</th>
                     <th className="py-3 px-2 w-24 text-cyan-400 font-semibold text-sm">Output</th>
-                    <th className="py-3 px-2 w-12 text-cyan-400 font-semibold text-sm"></th>
+                    <th className="py-3 px-2 w-24 text-cyan-400 font-semibold text-sm">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -960,12 +1025,30 @@ export default function DashboardPage() {
                       </td>
                       <td className="py-2 px-2 text-gray-400">{node.flag.toString()}</td>
                       <td className="py-2 px-2 text-gray-400">{node.output.toFixed(1)}</td>
-                      <td className="py-2 px-2 text-center">
-                        <button onClick={() => addModalNodeRow(index)} className="text-green-400 hover:text-green-300">
-                          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" />
-                          </svg>
-                        </button>
+                      <td className="py-2 px-2">
+                        <div className="flex items-center justify-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => addModalNodeRow(index)}
+                            title="Add New Node"
+                            className="text-green-400 hover:text-green-300"
+                          >
+                            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+                            </svg>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => deleteModalNodeRow(index)}
+                            disabled={index === 0}
+                            title="Delete Node"
+                            className="text-red-400 hover:text-red-300 disabled:opacity-30 disabled:cursor-not-allowed"
+                          >
+                            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+                            </svg>
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -973,6 +1056,13 @@ export default function DashboardPage() {
               </table>
             </div>
             <div className="flex space-x-3 mt-8 pt-4 border-t border-slate-700/50">
+              <button
+                type="button"
+                onClick={() => addModalNodeRow(modalNodes.length - 1)}
+                className="px-4 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium text-sm"
+              >
+                Add New Node
+              </button>
               <button
                 onClick={() => setShowAddNodeModal(false)}
                 className="flex-1 px-6 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium"
@@ -994,11 +1084,11 @@ export default function DashboardPage() {
       {showNetworkNameModal && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <div className="bg-slate-800 rounded-2xl p-8 max-w-md w-full border border-blue-500/30 shadow-2xl">
-            <h3 className="text-2xl font-bold text-white mb-6">Save Node Table</h3>
+            <h3 className="text-2xl font-bold text-white mb-6">Save Network</h3>
             <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Node Table Name
+                  Network Name
                 </label>
                 <input
                   type="text"
@@ -1034,7 +1124,7 @@ export default function DashboardPage() {
                 取消
               </button>
               <button
-                onClick={handleSaveNodeTable}
+                onClick={handleSaveNetwork}
                 disabled={!networkName.trim()}
                 className="flex-1 px-6 py-3 bg-gradient-to-r from-green-500 to-emerald-500 text-white rounded-lg hover:from-green-600 hover:to-emerald-600 transition-all font-medium disabled:opacity-50 disabled:cursor-not-allowed"
               >
@@ -1103,27 +1193,28 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* Edit Node Table Modal */}
+      {/* Edit Network Modal */}
       {showEditNodeModal && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <div className={`bg-slate-800 rounded-2xl p-8 w-full border border-blue-500/30 shadow-2xl flex flex-col max-h-[90vh] ${isEditingTable ? 'max-w-4xl' : 'max-w-md'}`}>
-            <h3 className="text-2xl font-bold text-white mb-6">Edit Node Table</h3>
+            <h3 className="text-2xl font-bold text-white mb-6">Edit Network</h3>
             
             {!isEditingTable ? (
-              // Step 1: Select Node Table
               <div className="space-y-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Select Node Table
+                    Select Network
                   </label>
                   <select 
-                    value={selectedNodeTable}
-                    onChange={(e) => setSelectedNodeTable(e.target.value)}
+                    value={selectedNetworkForEdit}
+                    onChange={(e) => setSelectedNetworkForEdit(e.target.value)}
                     className="w-full px-4 py-3 bg-slate-900 border border-blue-500/30 rounded-lg text-white focus:outline-none focus:border-cyan-400"
                   >
-                    <option value="">選擇要編輯的資料表...</option>
-                    {nodeTables.map(table => (
-                      <option key={table.id} value={table.id}>{table.name}</option>
+                    <option value="">選擇要編輯的網路...</option>
+                    {networks.map((net) => (
+                      <option key={net.id} value={net.id}>
+                        {net.name}{net.passReview ? ' (Reviewed)' : ''}
+                      </option>
                     ))}
                   </select>
                 </div>
@@ -1136,15 +1227,16 @@ export default function DashboardPage() {
                   </button>
                   <button
                     onClick={() => {
-                      const table = nodeTables.find(t => String(t.id) === selectedNodeTable);
-                      if (table) {
-                        setModalNodes(table.nodes.map(nodeToEditable));
+                      const net = networks.find((n) => String(n.id) === selectedNetworkForEdit);
+                      if (net) {
+                        setModalNodes(net.nodes.map(nodeToEditable));
+                        setEditingNetworkId(net.id);
                         setIsEditingTable(true);
                       } else {
-                        alert('Please select a node table to edit.');
+                        alert('Please select a network to edit.');
                       }
                     }}
-                    disabled={!selectedNodeTable}
+                    disabled={!selectedNetworkForEdit || networks.length === 0}
                     className="flex-1 px-6 py-3 bg-gradient-to-r from-cyan-500 to-blue-500 text-white rounded-lg hover:from-cyan-600 hover:to-blue-600 transition-all font-medium disabled:opacity-50"
                   >
                     Edit
@@ -1163,7 +1255,7 @@ export default function DashboardPage() {
                         <th className="py-3 px-2 w-32 text-cyan-400 font-semibold text-sm">Mean Time</th>
                         <th className="py-3 px-2 w-24 text-cyan-400 font-semibold text-sm">Flag</th>
                         <th className="py-3 px-2 w-24 text-cyan-400 font-semibold text-sm">Output</th>
-                        <th className="py-3 px-2 w-12 text-cyan-400 font-semibold text-sm"></th>
+                        <th className="py-3 px-2 w-24 text-cyan-400 font-semibold text-sm">Actions</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1177,8 +1269,9 @@ export default function DashboardPage() {
                                 type="text"
                                 value={node.previousNodes}
                                 onChange={(e) => handleModalNodeChange(index, 'previousNodes', e.target.value)}
-                                placeholder="1, 2"
+                                placeholder={index === 0 ? '' : '1, 2'}
                                 className="w-full px-1 py-1 bg-transparent text-white focus:outline-none"
+                                disabled={index === 0}
                               />
                               <span className="text-gray-400 pr-2">]</span>
                             </div>
@@ -1195,12 +1288,30 @@ export default function DashboardPage() {
                           </td>
                           <td className="py-2 px-2 text-gray-400">{node.flag.toString()}</td>
                           <td className="py-2 px-2 text-gray-400">{node.output.toFixed(1)}</td>
-                          <td className="py-2 px-2 text-center">
-                            <button onClick={() => addModalNodeRow(index)} className="text-green-400 hover:text-green-300">
-                              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" />
-                              </svg>
-                            </button>
+                          <td className="py-2 px-2">
+                            <div className="flex items-center justify-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() => addModalNodeRow(index)}
+                                title="Add New Node"
+                                className="text-green-400 hover:text-green-300"
+                              >
+                                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                </svg>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => deleteModalNodeRow(index)}
+                                disabled={index === 0}
+                                title="Delete Node"
+                                className="text-red-400 hover:text-red-300 disabled:opacity-30 disabled:cursor-not-allowed"
+                              >
+                                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                </svg>
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))}
@@ -1209,13 +1320,23 @@ export default function DashboardPage() {
                 </div>
                 <div className="flex space-x-3 mt-8 pt-4 border-t border-slate-700/50">
                   <button
-                    onClick={() => setIsEditingTable(false)}
+                    type="button"
+                    onClick={() => addModalNodeRow(modalNodes.length - 1)}
+                    className="px-4 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium text-sm"
+                  >
+                    Add New Node
+                  </button>
+                  <button
+                    onClick={() => {
+                      setIsEditingTable(false);
+                      setEditingNetworkId(null);
+                    }}
                     className="px-6 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium"
                   >
                     返回
                   </button>
                   <button
-                    onClick={handleUpdateNodeTable}
+                    onClick={handleUpdateNetwork}
                     className="flex-1 px-6 py-3 bg-gradient-to-r from-green-500 to-emerald-500 text-white rounded-lg hover:from-green-600 hover:to-emerald-600 transition-all font-medium"
                   >
                     儲存變更
@@ -1227,25 +1348,25 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* Review Node Table Modal */}
+      {/* Review Network Modal */}
       {showReviewNodeModal && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <div className="bg-slate-800 rounded-2xl p-8 max-w-md w-full border border-blue-500/30 shadow-2xl">
-            <h3 className="text-2xl font-bold text-white mb-6">Review Node Table</h3>
+            <h3 className="text-2xl font-bold text-white mb-6">Review Network</h3>
             <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Select Node Table to Review
+                  Select Network to Review
                 </label>
                 <select 
-                  value={selectedNodeTableForReview}
-                  onChange={(e) => setSelectedNodeTableForReview(e.target.value)}
+                  value={selectedNetworkForReview}
+                  onChange={(e) => setSelectedNetworkForReview(e.target.value)}
                   className="w-full px-4 py-3 bg-slate-900 border border-blue-500/30 rounded-lg text-white focus:outline-none focus:border-cyan-400"
                 >
-                  <option value="">選擇要審查的資料表...</option>
-                  {nodeTables.map(table => (
-                    <option key={table.id} value={table.id}>
-                      {table.name} {table.passFlag && ' (Passed)'}
+                  <option value="">選擇要審查的網路...</option>
+                  {networks.map((net) => (
+                    <option key={net.id} value={net.id}>
+                      {net.name}{net.passReview ? ' (Passed)' : ''}
                     </option>
                   ))}
                 </select>
@@ -1259,8 +1380,8 @@ export default function DashboardPage() {
                 取消
               </button>
               <button
-                onClick={handleReviewNodeTable}
-                disabled={!selectedNodeTableForReview}
+                onClick={handleReviewNetwork}
+                disabled={!selectedNetworkForReview || networks.length === 0}
                 className="flex-1 px-6 py-3 bg-gradient-to-r from-cyan-500 to-blue-500 text-white rounded-lg hover:from-cyan-600 hover:to-blue-600 transition-all font-medium disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Review
@@ -1278,43 +1399,28 @@ export default function DashboardPage() {
             <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Select Reviewed Node Table
+                  Select Reviewed Network
                 </label>
                 <select 
-                  value={selectedPassedTable}
+                  value={selectedReviewedNetwork}
                   onChange={(e) => {
-                    setSelectedPassedTable(e.target.value);
-                    const table = nodeTables.find(nodeTable => String(nodeTable.id) === e.target.value);
-                    setGraphNetworkName(table?.name || '');
+                    setSelectedReviewedNetwork(e.target.value);
+                    const net = networks.find((n) => String(n.id) === e.target.value);
+                    setGraphNetworkName(net?.name || '');
                   }}
                   className="w-full px-4 py-3 bg-slate-900 border border-blue-500/30 rounded-lg text-white focus:outline-none focus:border-cyan-400"
                 >
-                  <option value="">Select a passed table...</option>
-                  {nodeTables
-                    .filter(table => table.passFlag === true)
-                    .map(table => (
-                      <option key={table.id} value={table.id}>
-                        {table.name}
+                  <option value="">Select a reviewed network...</option>
+                  {networks
+                    .filter((net) => net.passReview === true)
+                    .map((net) => (
+                      <option key={net.id} value={net.id}>
+                        {net.name}
                       </option>
                     ))}
                 </select>
                 <p className="text-xs text-gray-500 mt-1">
-                  Only tables that passed review are available
-                </p>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Network Name
-                </label>
-                <input
-                  type="text"
-                  value={graphNetworkName}
-                  onChange={(e) => setGraphNetworkName(e.target.value)}
-                  placeholder={nodeTables.find(table => String(table.id) === selectedPassedTable)?.name || "Enter network name"}
-                  className="w-full px-4 py-3 bg-slate-900 border border-blue-500/30 rounded-lg text-white focus:outline-none focus:border-cyan-400"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Leave empty to use table name
+                  Only networks that passed review are available
                 </p>
               </div>
             </div>
@@ -1322,7 +1428,7 @@ export default function DashboardPage() {
               <button
                 onClick={() => {
                   setShowGraphNetworkModal(false);
-                  setSelectedPassedTable('');
+                  setSelectedReviewedNetwork('');
                   setGraphNetworkName('');
                 }}
                 className="flex-1 px-6 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium"
@@ -1331,10 +1437,10 @@ export default function DashboardPage() {
               </button>
               <button
                 onClick={handleGraphNetwork}
-                disabled={!selectedPassedTable}
+                disabled={!selectedReviewedNetwork}
                 className="flex-1 px-6 py-3 bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 transition-all font-medium disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Create Network
+                Graph Network
               </button>
             </div>
           </div>
@@ -1346,7 +1452,7 @@ export default function DashboardPage() {
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <div className="bg-slate-800 rounded-2xl p-8 max-w-lg w-full border border-red-500/30 shadow-2xl flex flex-col max-h-[90vh]">
             <h3 className="text-2xl font-bold text-red-400 mb-4">Review Failed</h3>
-            <p className="text-gray-300 mb-6">The following issues were found in the node table:</p>
+            <p className="text-gray-300 mb-6">The following issues were found in the network:</p>
             <div className="flex-grow overflow-y-auto bg-slate-900/50 rounded-lg p-4 space-y-2 border border-slate-700">
               {reviewErrors.map((error, index) => (
                 <p key={index} className="text-red-300 text-sm">
