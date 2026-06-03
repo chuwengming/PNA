@@ -26,8 +26,8 @@ interface EditableNode {
 // 定義網路型別
 interface Network {
   id: number;
+  userId?: number;
   name: string;
-  nodeTableId?: number | null;
   nodeCount?: number;
   predecessors?: number[][];
   meanTimes?: number[];
@@ -35,10 +35,9 @@ interface Network {
   graph: string;
 }
 
-// 定義節點參數資料表型別
+// Node Table 僅存在瀏覽器工作階段（不寫入資料庫）
 interface NodeTable {
   id: number;
-  ownerUserId: string;
   name: string;
   nodes: Node[];
   passFlag: boolean;
@@ -54,11 +53,10 @@ interface GenerateForm {
   nodeNumbers: string;
 }
 
-interface ReviewResponse {
+interface ValidateNodesResponse {
   success: boolean;
   passed: boolean;
   errors: string[];
-  nodeTable?: NodeTable;
 }
 
 // API 響應型別
@@ -177,37 +175,32 @@ export default function DashboardPage() {
     }
   }, [status, router]);
 
-  const ownerUserId = session?.user?.id ? String(session.user.id) : '';
+  const userId = session?.user?.id ? Number(session.user.id) : NaN;
+  const hasDbUser = Number.isFinite(userId) && userId > 0;
 
   useEffect(() => {
-    if (!ownerUserId) return;
+    if (!hasDbUser) return;
 
-    const loadPersistedData = async () => {
+    const loadPersistedNetworks = async () => {
       try {
-        const [nodeTableResponse, networkResponse] = await Promise.all([
-          fetch(`/api/python/node-tables?ownerUserId=${encodeURIComponent(ownerUserId)}`),
-          fetch(`/api/python/networks?ownerUserId=${encodeURIComponent(ownerUserId)}`)
-        ]);
+        const networkResponse = await fetch(
+          `/api/python/networks?userId=${encodeURIComponent(String(userId))}`
+        );
 
-        if (!nodeTableResponse.ok) {
-          throw new Error(await apiErrorMessage(nodeTableResponse));
-        }
         if (!networkResponse.ok) {
           throw new Error(await apiErrorMessage(networkResponse));
         }
 
-        const persistedNodeTables: NodeTable[] = await nodeTableResponse.json();
         const persistedNetworks: Network[] = await networkResponse.json();
-        setNodeTables(persistedNodeTables);
         setNetworks(persistedNetworks);
       } catch (error) {
-        console.error('Error loading persisted dashboard data:', error);
-        setGenerationError(error instanceof Error ? error.message : 'Failed to load persisted data');
+        console.error('Error loading persisted networks:', error);
+        setGenerationError(error instanceof Error ? error.message : 'Failed to load saved networks');
       }
     };
 
-    loadPersistedData();
-  }, [ownerUserId]);
+    loadPersistedNetworks();
+  }, [hasDbUser, userId]);
 
   if (status === 'loading') {
     return (
@@ -274,14 +267,10 @@ export default function DashboardPage() {
     setModalNodes(newModalNodes);
   };
 
-  // 儲存節點參數資料表
-  const handleSaveNodeTable = async () => {
+  // 儲存節點參數資料表（僅本機工作階段）
+  const handleSaveNodeTable = () => {
   if (!networkName.trim()) {
     alert('Please enter a table name.');
-    return;
-  }
-  if (!ownerUserId) {
-    alert('Please sign in again before saving.');
     return;
   }
 
@@ -295,40 +284,21 @@ export default function DashboardPage() {
     return;
   }
 
-  try {
-    const response = await fetch('/api/python/node-tables', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ownerUserId,
-        name: networkName,
-        nodes: validModalNodes.map(editableToNode)
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(await apiErrorMessage(response));
-    }
-
-    const newNodeTable: NodeTable = await response.json();
-    setNodeTables(prevNodeTables => [newNodeTable, ...prevNodeTables]);
-    setNetworkName('');
-    setShowNetworkNameModal(false);
-    setShowAddNodeModal(false);
-    alert(`Node Table "${newNodeTable.name}" saved successfully!`);
-  } catch (error) {
-    console.error('Error saving node table:', error);
-    alert(error instanceof Error ? error.message : 'Failed to save node table.');
-  }
+  const newNodeTable: NodeTable = {
+    id: Date.now(),
+    name: networkName.trim(),
+    nodes: validModalNodes.map(editableToNode),
+    passFlag: false,
+  };
+  setNodeTables(prevNodeTables => [newNodeTable, ...prevNodeTables]);
+  setNetworkName('');
+  setShowNetworkNameModal(false);
+  setShowAddNodeModal(false);
+  alert(`Node Table "${newNodeTable.name}" saved in this session.`);
 };
 
-  // 更新節點參數資料表
-  const handleUpdateNodeTable = async () => {
-  if (!ownerUserId) {
-    alert('Please sign in again before saving.');
-    return;
-  }
-
+  // 更新節點參數資料表（僅本機工作階段）
+  const handleUpdateNodeTable = () => {
   const tableIndex = nodeTables.findIndex(t => String(t.id) === selectedNodeTable);
   if (tableIndex === -1) {
     alert('Could not find the selected table to update.');
@@ -346,34 +316,18 @@ export default function DashboardPage() {
   }
 
   const selectedTable = nodeTables[tableIndex];
-
-  try {
-    const response = await fetch(`/api/python/node-tables/${selectedTable.id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ownerUserId,
-        name: selectedTable.name,
-        nodes: validModalNodes.map(editableToNode)
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(await apiErrorMessage(response));
-    }
-
-    const updatedNodeTable: NodeTable = await response.json();
-    setNodeTables(prevNodeTables =>
-      prevNodeTables.map(table => table.id === updatedNodeTable.id ? updatedNodeTable : table)
-    );
-    setShowEditNodeModal(false);
-    setIsEditingTable(false);
-    setSelectedNodeTable('');
-    alert(`Node Table "${updatedNodeTable.name}" updated successfully!`);
-  } catch (error) {
-    console.error('Error updating node table:', error);
-    alert(error instanceof Error ? error.message : 'Failed to update node table.');
-  }
+  const updatedNodeTable: NodeTable = {
+    ...selectedTable,
+    nodes: validModalNodes.map(editableToNode),
+    passFlag: false,
+  };
+  setNodeTables(prevNodeTables =>
+    prevNodeTables.map(table => table.id === updatedNodeTable.id ? updatedNodeTable : table)
+  );
+  setShowEditNodeModal(false);
+  setIsEditingTable(false);
+  setSelectedNodeTable('');
+  alert(`Node Table "${updatedNodeTable.name}" updated. Please review again before graphing.`);
 };
 
   // 選擇網路
@@ -393,8 +347,8 @@ export default function DashboardPage() {
       alert('Please enter a network name.');
       return;
     }
-    if (!ownerUserId) {
-      alert('Please sign in again before saving.');
+    if (!hasDbUser) {
+      alert('Please sign in with a database-backed account before saving networks.');
       return;
     }
     const nodeCount = parseInt(generateForm.nodeNumbers);
@@ -451,24 +405,42 @@ export default function DashboardPage() {
           output: node.output
         }));
 
-        const saveResponse = await fetch('/api/python/node-tables', {
+        const saveResponse = await fetch('/api/python/networks/graph', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            ownerUserId,
+            userId,
             name: randomNetworkName,
-            nodes: editableNodes.map(editableToNode)
-          })
+            nodes: convertedNodes.map(n => ({
+              id: n.id,
+              previousNodes: n.previousNodes,
+              meanTime: n.meanTime,
+              flag: n.flag,
+              output: n.output,
+            })),
+          }),
         });
 
         if (!saveResponse.ok) {
           throw new Error(await apiErrorMessage(saveResponse));
         }
 
-        const newNodeTable: NodeTable = await saveResponse.json();
+        const savedNetwork: Network = await saveResponse.json();
+        setNetworks(prev => {
+          const idx = prev.findIndex(n => n.id === savedNetwork.id);
+          if (idx === -1) return [savedNetwork, ...prev];
+          return prev.map(n => (n.id === savedNetwork.id ? savedNetwork : n));
+        });
+
+        const newNodeTable: NodeTable = {
+          id: Date.now(),
+          name: randomNetworkName,
+          nodes: convertedNodes,
+          passFlag: true,
+        };
         setNodeTables(prevNodeTables => [newNodeTable, ...prevNodeTables]);
         
-        alert(`Successfully generated and saved Node Table "${randomNetworkName}" with ${nodeCount} nodes!`);
+        alert(`Successfully generated and saved network "${randomNetworkName}" with ${nodeCount} nodes!`);
       } else {
         throw new Error('Generation failed');
       }
@@ -490,14 +462,18 @@ export default function DashboardPage() {
       alert('Please select a node table.');
       return;
     }
-    if (!ownerUserId) {
-      alert('Please sign in again before creating a network.');
+    if (!hasDbUser) {
+      alert('Please sign in with a database-backed account before saving networks.');
       return;
     }
 
     const table = nodeTables.find(t => String(t.id) === selectedPassedTable);
     if (!table) {
       alert('Selected table not found.');
+      return;
+    }
+    if (!table.passFlag) {
+      alert('Please review and pass the node table before creating a network.');
       return;
     }
 
@@ -513,9 +489,15 @@ export default function DashboardPage() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          ownerUserId,
-          nodeTableId: table.id,
-          networkName
+          userId,
+          name: networkName,
+          nodes: table.nodes.map(n => ({
+            id: n.id,
+            previousNodes: n.previousNodes,
+            meanTime: n.meanTime,
+            flag: n.flag,
+            output: n.output,
+          })),
         }),
       });
       
@@ -549,11 +531,6 @@ export default function DashboardPage() {
 
   // 審查節點參數資料表
   const handleReviewNodeTable = async () => {
-    if (!ownerUserId) {
-      alert('Please sign in again before reviewing.');
-      return;
-    }
-
     const table = nodeTables.find(t => String(t.id) === selectedNodeTableForReview);
     if (!table) {
       alert('Selected node table not found.');
@@ -561,35 +538,42 @@ export default function DashboardPage() {
     }
 
     try {
-      const response = await fetch(
-        `/api/python/node-tables/${table.id}/review?ownerUserId=${encodeURIComponent(ownerUserId)}`,
-        { method: 'POST' }
-      );
+      const response = await fetch('/api/python/validate-nodes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          nodes: table.nodes.map(n => ({
+            id: n.id,
+            previousNodes: n.previousNodes,
+            meanTime: n.meanTime,
+            flag: n.flag,
+            output: n.output,
+          })),
+        }),
+      });
 
       if (!response.ok) {
         throw new Error(await apiErrorMessage(response));
       }
 
-      const review: ReviewResponse = await response.json();
+      const review: ValidateNodesResponse = await response.json();
 
       if (!review.passed) {
         setReviewErrors(review.errors);
         setShowReviewErrorsModal(true);
-        const reviewedTable = review.nodeTable;
-        if (reviewedTable) {
-          setNodeTables(prevNodeTables =>
-            prevNodeTables.map(nodeTable => nodeTable.id === reviewedTable.id ? reviewedTable : nodeTable)
-          );
-        }
+        setNodeTables(prevNodeTables =>
+          prevNodeTables.map(nodeTable =>
+            nodeTable.id === table.id ? { ...nodeTable, passFlag: false } : nodeTable
+          )
+        );
         return;
       }
 
-      const reviewedTable = review.nodeTable;
-      if (reviewedTable) {
-        setNodeTables(prevNodeTables =>
-          prevNodeTables.map(nodeTable => nodeTable.id === reviewedTable.id ? reviewedTable : nodeTable)
-        );
-      }
+      setNodeTables(prevNodeTables =>
+        prevNodeTables.map(nodeTable =>
+          nodeTable.id === table.id ? { ...nodeTable, passFlag: true } : nodeTable
+        )
+      );
       alert(`Node Table "${table.name}" has passed the review!`);
       setShowReviewNodeModal(false);
       setSelectedNodeTableForReview('');
