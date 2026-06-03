@@ -14,11 +14,28 @@ import bcrypt
 import json
 import os
 from contextlib import contextmanager
+from pathlib import Path
 from typing import List, Optional
 from urllib.parse import unquote, urlparse
 
 import pymysql
 from pymysql.cursors import DictCursor
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_local_env():
+    """本機開發：載入 .env（MySQL）與 .env.local（NextAuth / OAuth）。"""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+
+    load_dotenv(_PROJECT_ROOT / ".env")
+    load_dotenv(_PROJECT_ROOT / ".env.local", override=True)
+
+
+_load_local_env()
 
 app = FastAPI()
 
