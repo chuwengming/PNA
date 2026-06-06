@@ -7,6 +7,8 @@ import Image from 'next/image';
 export default function DocsPage() {
   const [question, setQuestion] = useState('');
   const [answer, setAnswer] = useState('');
+  const [sources, setSources] = useState<Array<{ source: string; page: number; score: number }>>([]);
+  const [webSearchUsed, setWebSearchUsed] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -16,6 +18,8 @@ export default function DocsPage() {
 
     setIsLoading(true);
     setAnswer('');
+    setSources([]);
+    setWebSearchUsed(false);
     setError('');
 
     try {
@@ -34,6 +38,8 @@ export default function DocsPage() {
 
       const data = await response.json();
       setAnswer(data.answer);
+      setSources(Array.isArray(data.sources) ? data.sources : []);
+      setWebSearchUsed(Boolean(data.web_search_used));
 
     } catch (err: any) {
       setError(err.message);
@@ -65,7 +71,7 @@ export default function DocsPage() {
           <div className="text-center mb-12">
             <h1 className="text-4xl md:text-5xl font-bold text-white mb-4">專案文件問答</h1>
             <p className="text-lg text-gray-400">
-              對專案有任何問題嗎？讓 AI Agent 來協助您！
+              對專案有任何問題嗎？Gemini AI 將依據專案文件內容為您解答。
             </p>
           </div>
 
@@ -98,16 +104,33 @@ export default function DocsPage() {
           {isLoading && (
              <div className="text-center">
                 <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-cyan-400 mx-auto"></div>
-                <p className="text-white mt-4">AI Agent 正在為您查找答案...</p>
+                <p className="text-white mt-4">Gemini 正在依據文件內容查找答案...</p>
              </div>
           )}
 
           {answer && (
             <div className="bg-slate-800/50 backdrop-blur-sm rounded-2xl p-6 border border-blue-500/30 shadow-xl">
-              <h2 className="text-2xl font-bold text-white mb-4">AI Agent 的回覆</h2>
+              <h2 className="text-2xl font-bold text-white mb-4">Gemini 的回覆</h2>
               <div className="prose prose-invert prose-lg max-w-none text-gray-300 whitespace-pre-wrap">
                 {answer}
               </div>
+              {webSearchUsed && (
+                <p className="mt-4 text-sm text-gray-400">
+                  本次回覆已搭配網路搜尋，補充說明專有名詞（文件內容仍為主要依據）。
+                </p>
+              )}
+              {sources.length > 0 && (
+                <div className="mt-6 pt-4 border-t border-blue-500/20">
+                  <h3 className="text-sm font-semibold text-cyan-300 mb-2">參考來源</h3>
+                  <ul className="space-y-1 text-sm text-gray-400">
+                    {sources.map((item, index) => (
+                      <li key={`${item.source}-${item.page}-${index}`}>
+                        {item.source}（第 {item.page} 頁，相關度 {(item.score * 100).toFixed(1)}%）
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </div>
           )}
         </div>

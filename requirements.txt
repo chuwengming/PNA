@@ -6,3 +6,8 @@ PyMySQL==1.1.1
 cryptography>=42.0.0
 bcrypt==4.2.0
 python-dotenv==1.0.1
+google-generativeai==0.8.5
+pypdf==5.4.0
+sentence-transformers==3.4.1
+requests>=2.31.0
+duckduckgo-search>=7.2.0

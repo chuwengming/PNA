@@ -13,6 +13,8 @@
     "build": "next build && npm run install-python",
     "start": "next start",
     "railway-start": "npm run install-python && node scripts/start-production.mjs",
+    "build-docs-index": "npm run install-python && node scripts/build-docs-index.mjs",
+    "validate-docs-index": "npm run install-python && node scripts/validate-docs-index.mjs",
     "lint": "eslint",
     "dev:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-dev.ps1"
   },

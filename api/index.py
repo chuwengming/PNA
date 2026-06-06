@@ -14,11 +14,14 @@ import bcrypt
 import json
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import pymysql
 
 from api.database import db_connection
+from api.rag.config import DOCS_INDEX_FILE
+from api.rag.ingest import build_index, index_status
+from api.rag.query import GenerationError, GenerationQuotaError, answer_question
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -37,6 +40,28 @@ def _load_local_env():
 _load_local_env()
 
 app = FastAPI()
+
+
+def _ensure_docs_index() -> None:
+    if DOCS_INDEX_FILE.exists():
+        return
+    try:
+        result = build_index()
+        print(
+            "[docs-rag] 已建立索引:",
+            result["index_file"],
+            f"({result['chunk_count']} chunks, {result.get('embedding_provider')})",
+        )
+    except Exception as error:
+        print(f"[docs-rag] 索引建立失敗: {error}")
+        print(
+            "[docs-rag] 請在本機執行: npm run build-docs-index"
+        )
+
+
+@app.on_event("startup")
+def prepare_docs_index() -> None:
+    _ensure_docs_index()
 
 class UserRegisterRequest(BaseModel):
     email: str
@@ -95,6 +120,29 @@ class NetworkResponse(BaseModel):
     nodeCount: int
     nodes: List[NetworkNode]
     graph: str
+
+
+class DocsAskRequest(BaseModel):
+    question: str
+
+
+class DocsAskResponse(BaseModel):
+    answer: str
+    sources: List[Dict[str, Any]]
+    model: str
+    web_search_used: bool = False
+    web_search_queries: List[str] = Field(default_factory=list)
+
+
+class DocsIndexStatusResponse(BaseModel):
+    ready: bool
+    index_file: str
+    chunk_count: int
+    sources: List[str]
+    created_at: Optional[str] = None
+    embedding_provider: Optional[str] = None
+    embedding_model: Optional[str] = None
+    embedding_dimension: Optional[int] = None
 
 
 class SaveNetworkRequest(BaseModel):
@@ -915,6 +963,55 @@ def list_networks(userId: int, includeGraph: bool = False):
         row_to_saved_network_response(row, include_graph=includeGraph)
         for row in rows
     ]
+
+
+@app.get("/api/python/docs/status", response_model=DocsIndexStatusResponse)
+def docs_status():
+    return index_status()
+
+
+@app.post("/api/python/docs/ask", response_model=DocsAskResponse)
+def docs_ask(request: DocsAskRequest):
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="提問內容不可為空")
+
+    try:
+        if not DOCS_INDEX_FILE.exists():
+            _ensure_docs_index()
+        return answer_question(question)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=503, detail=str(error))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except GenerationQuotaError as error:
+        raise HTTPException(status_code=503, detail=str(error))
+    except GenerationError as error:
+        raise HTTPException(status_code=502, detail=str(error))
+    except RuntimeError as error:
+        raise HTTPException(status_code=500, detail=str(error))
+    except Exception as error:
+        message = str(error)
+        if "429" in message or "quota" in message.lower():
+            raise HTTPException(
+                status_code=503,
+                detail="Gemini API 配額已用盡。請稍後再試，或改用 GENERATION_PROVIDER=ollama。",
+            )
+        raise HTTPException(status_code=500, detail=f"Docs RAG 錯誤: {error}")
+
+
+@app.post("/api/python/docs/rebuild-index")
+def docs_rebuild_index():
+    try:
+        return build_index()
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except RuntimeError as error:
+        raise HTTPException(status_code=500, detail=str(error))
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"建立索引失敗: {error}")
 
 
 @app.post("/api/python/graph-network", response_model=NetworkResponse)
