@@ -1,4 +1,4 @@
--- Railway MySQL: users + saved_networks (no graph column — rendered on demand)
+-- Railway MySQL: users + saved_networks (ETS node structure)
 
 SET NAMES utf8mb4;
 SET FOREIGN_KEY_CHECKS = 0;
@@ -18,8 +18,12 @@ CREATE TABLE IF NOT EXISTS saved_networks (
   user_id BIGINT NOT NULL,
   name VARCHAR(191) NOT NULL,
   node_count INT NOT NULL,
-  predecessors_json JSON NOT NULL COMMENT '長度 N：每個節點的前置節點 ID 列表',
-  mean_times_json JSON NOT NULL COMMENT '長度 N：每個節點的 mean time',
+  prec_nodes_json JSON NOT NULL COMMENT '長度 N：Prec_Node(i) 前置節點 ID 列表',
+  node_times_json JSON NOT NULL COMMENT '長度 N：Node_Time(i) 靜態均值（規劃輸入）',
+  finish_flags_json JSON NOT NULL COMMENT '長度 N：finish_flag_i，初始全 false',
+  outputs_json JSON NOT NULL COMMENT '長度 N：Output_i 離散隨機變數，初始 [0:1]',
+  path_flags_json JSON NOT NULL COMMENT '長度 N：Path_Flag(i) 整數串列，初始全 0',
+  path_times_json JSON NOT NULL COMMENT '長度 N：Path_Time(i) 隨機變數串列，初始各 [0:1]',
   pass_review TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1=已通過 Review，才可 Graph Network',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

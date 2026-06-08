@@ -19,6 +19,15 @@ from typing import Any, Dict, List, Optional
 import pymysql
 
 from api.database import db_connection
+from api.network.ets_node import (
+    ETSNode,
+    create_ets_node,
+    default_outputs,
+    default_path_flags,
+    default_path_times,
+    ets_nodes_from_planning,
+)
+from api.network.stochastic import initial_stochastic, node_time_mean, stochastic_notation
 from api.rag.config import DOCS_INDEX_FILE
 from api.rag.ingest import build_index, index_status
 from api.rag.query import GenerationError, GenerationQuotaError, answer_question
@@ -90,12 +99,27 @@ class ApiMessageResponse(BaseModel):
     user: Optional[UserResponse] = None
 
 
+class StochasticVariableModel(BaseModel):
+    values: List[float] = Field(default_factory=lambda: [0.0])
+    probabilities: List[float] = Field(default_factory=lambda: [1.0])
+    mean: float = 0.0
+    stdDev: float = 0.0
+    method: str = "initial"
+    notation: Optional[str] = None
+
+
 class NodeInput(BaseModel):
+    """ETS node — API / frontend payload (see docs/definitions/07-ets-node-structure.md)."""
     id: int = Field(ge=0)
-    previousNodes: List[int] = Field(default_factory=list)
-    meanTime: float = 0.0
-    flag: bool = False
-    output: float = 0.0
+    precNode: List[int] = Field(default_factory=list)
+    nodeTime: float = 0.0
+    finishFlag: bool = False
+    output: Optional[StochasticVariableModel] = None
+    pathFlag: List[int] = Field(default_factory=list)
+    pathTime: List[StochasticVariableModel] = Field(default_factory=list)
+    # Display helpers (optional, from API responses)
+    outputNotation: Optional[str] = None
+    pathTimeNotation: Optional[List[str]] = None
 
 
 class GraphNetworkRequest(BaseModel):
@@ -110,10 +134,14 @@ class ValidateNodesResponse(BaseModel):
 
 class NetworkNode(BaseModel):
     id: int
-    flag: bool
-    pre_node: List[int]
-    mean_val: float
-    output: float
+    precNode: List[int]
+    nodeTime: float
+    finishFlag: bool
+    output: StochasticVariableModel
+    outputNotation: str
+    pathFlag: List[int]
+    pathTime: List[StochasticVariableModel]
+    pathTimeNotation: List[str]
 
 class NetworkResponse(BaseModel):
     success: bool
@@ -166,14 +194,24 @@ class ReviewNetworkRequest(BaseModel):
     userId: int
 
 
+class UpdateEtsRuntimeRequest(BaseModel):
+    """Persist algorithm runtime fields without resetting to planning defaults."""
+    userId: int
+    nodes: List[NodeInput]
+
+
 class SavedNetworkResponse(BaseModel):
-    """儲存與回傳：簡化欄位 + 還原後的 nodes（供前端表格與繪圖一致）。"""
+    """儲存與回傳：ETS 節點快照 + 還原後 nodes（供前端表格與繪圖）。"""
     id: int
     userId: int
     name: str
     nodeCount: int
-    predecessors: List[List[int]]
-    meanTimes: List[float]
+    precNodes: List[List[int]]
+    nodeTimes: List[float]
+    finishFlags: List[bool]
+    outputs: List[StochasticVariableModel]
+    pathFlags: List[List[int]]
+    pathTimes: List[List[StochasticVariableModel]]
     nodes: List[NodeInput]
     graph: str
     passReview: bool
@@ -215,8 +253,12 @@ def init_schema(connection):
                 user_id BIGINT NOT NULL,
                 name VARCHAR(191) NOT NULL,
                 node_count INT NOT NULL,
-                predecessors_json JSON NOT NULL,
-                mean_times_json JSON NOT NULL,
+                prec_nodes_json JSON NOT NULL,
+                node_times_json JSON NOT NULL,
+                finish_flags_json JSON NOT NULL,
+                outputs_json JSON NOT NULL,
+                path_flags_json JSON NOT NULL,
+                path_times_json JSON NOT NULL,
                 pass_review TINYINT(1) NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -231,7 +273,7 @@ def init_schema(connection):
 
 
 def migrate_schema(connection):
-    """資料表遷移：移除 graph 欄位、補上 pass_review。"""
+    """資料表遷移：graph 移除、pass_review、ETS 欄位、舊欄位更名。"""
     with connection.cursor() as cursor:
         cursor.execute(
             """
@@ -259,6 +301,123 @@ def migrate_schema(connection):
                 "ALTER TABLE saved_networks ADD COLUMN pass_review TINYINT(1) NOT NULL DEFAULT 0"
             )
 
+        # predecessors_json -> prec_nodes_json
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'saved_networks'
+              AND COLUMN_NAME = 'prec_nodes_json'
+            """
+        )
+        if cursor.fetchone()["cnt"] == 0:
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'saved_networks'
+                  AND COLUMN_NAME = 'predecessors_json'
+                """
+            )
+            if cursor.fetchone()["cnt"]:
+                cursor.execute(
+                    "ALTER TABLE saved_networks CHANGE COLUMN predecessors_json prec_nodes_json JSON NOT NULL"
+                )
+            else:
+                cursor.execute(
+                    "ALTER TABLE saved_networks ADD COLUMN prec_nodes_json JSON NOT NULL"
+                )
+
+        # mean_times_json -> node_times_json
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'saved_networks'
+              AND COLUMN_NAME = 'node_times_json'
+            """
+        )
+        if cursor.fetchone()["cnt"] == 0:
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'saved_networks'
+                  AND COLUMN_NAME = 'mean_times_json'
+                """
+            )
+            if cursor.fetchone()["cnt"]:
+                cursor.execute(
+                    "ALTER TABLE saved_networks CHANGE COLUMN mean_times_json node_times_json JSON NOT NULL"
+                )
+            else:
+                cursor.execute(
+                    "ALTER TABLE saved_networks ADD COLUMN node_times_json JSON NOT NULL"
+                )
+
+        for col, default_expr in [
+            ("finish_flags_json", "'[]'"),
+            ("outputs_json", "'[]'"),
+            ("path_flags_json", "'[]'"),
+            ("path_times_json", "'[]'"),
+        ]:
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'saved_networks'
+                  AND COLUMN_NAME = %s
+                """,
+                (col,),
+            )
+            if cursor.fetchone()["cnt"] == 0:
+                cursor.execute(
+                    f"ALTER TABLE saved_networks ADD COLUMN {col} JSON NOT NULL"
+                )
+
+        # Backfill ETS runtime columns for legacy rows
+        cursor.execute("SELECT id, node_count, prec_nodes_json, node_times_json FROM saved_networks")
+        for row in cursor.fetchall():
+            n = int(row["node_count"])
+            prec_raw = row["prec_nodes_json"]
+            prec = json.loads(prec_raw) if isinstance(prec_raw, str) else prec_raw
+            cursor.execute(
+                """
+                SELECT finish_flags_json, outputs_json, path_flags_json, path_times_json
+                FROM saved_networks WHERE id = %s
+                """,
+                (row["id"],),
+            )
+            ets_row = cursor.fetchone()
+            finish_raw = ets_row["finish_flags_json"]
+            finish = json.loads(finish_raw) if isinstance(finish_raw, str) else finish_raw
+            if not finish or len(finish) != n:
+                cursor.execute(
+                    "UPDATE saved_networks SET finish_flags_json = %s WHERE id = %s",
+                    (json.dumps([False] * n), row["id"]),
+                )
+            outputs_raw = ets_row["outputs_json"]
+            outputs = json.loads(outputs_raw) if isinstance(outputs_raw, str) else outputs_raw
+            if not outputs or len(outputs) != n:
+                cursor.execute(
+                    "UPDATE saved_networks SET outputs_json = %s WHERE id = %s",
+                    (json.dumps(default_outputs(n)), row["id"]),
+                )
+            pf_raw = ets_row["path_flags_json"]
+            pf = json.loads(pf_raw) if isinstance(pf_raw, str) else pf_raw
+            if not pf or len(pf) != n:
+                cursor.execute(
+                    "UPDATE saved_networks SET path_flags_json = %s WHERE id = %s",
+                    (json.dumps(default_path_flags(prec)), row["id"]),
+                )
+            pt_raw = ets_row["path_times_json"]
+            pt = json.loads(pt_raw) if isinstance(pt_raw, str) else pt_raw
+            if not pt or len(pt) != n:
+                cursor.execute(
+                    "UPDATE saved_networks SET path_times_json = %s WHERE id = %s",
+                    (json.dumps(default_path_times(prec)), row["id"]),
+                )
+
 
 @app.on_event("startup")
 def startup():
@@ -270,37 +429,59 @@ def startup():
         init_schema(connection)
         migrate_schema(connection)
 
-class node:
-    def __init__(self, node_id):
-        if not isinstance(node_id, int) or node_id < 0:
-            raise ValueError("node_id 必須是非負整數")
-        
-        self.__id = node_id
-        self.flag = False
-        self.pre_node = []
-        self.mean_val = 0.0
-        self.pre_path = []
-        self.output = 0.0
-    
-    @property
-    def id(self):
-        return self.__id
-    
-    def to_dict(self):
-        """轉換為字典格式以便 JSON 序列化"""
-        return {
-            'id': self.id,
-            'flag': self.flag,
-            'pre_node': self.pre_node,
-            'mean_val': round(self.mean_val, 2),
-            'output': self.output
-        }
-    
-    def __str__(self):
-        return f"Node(id={self.id}, flag={self.flag}, pre_node={self.pre_node}, mean_val={self.mean_val:.2f}, output={self.output})"
-    
-    def __repr__(self):
-        return self.__str__()
+def _is_initial_stochastic(data: dict) -> bool:
+    return (
+        abs(float(data.get("mean", 0.0))) <= 1e-9
+        and len(data.get("values", [])) == 1
+        and abs(float(data["values"][0])) <= 1e-9
+    )
+
+
+def node_input_to_ets(data: NodeInput, reset_runtime: bool = False) -> ETSNode:
+    node = create_ets_node(data.id, data.precNode, float(data.nodeTime))
+    if reset_runtime:
+        node.reset_runtime_state()
+        return node
+    node.finish_flag = bool(data.finishFlag)
+    if data.output is not None:
+        node.output = data.output.model_dump()
+    node.sync_path_arrays()
+    if data.pathFlag:
+        node.path_flag = list(data.pathFlag)[: len(node.prec_node)]
+    if data.pathTime:
+        node.path_time = [p.model_dump() for p in data.pathTime[: len(node.prec_node)]]
+    node.sync_path_arrays()
+    return node
+
+
+def ets_to_node_input(node: ETSNode) -> NodeInput:
+    d = node.to_api_node()
+    return NodeInput(
+        id=d["id"],
+        precNode=d["precNode"],
+        nodeTime=d["nodeTime"],
+        finishFlag=d["finishFlag"],
+        output=StochasticVariableModel(**d["output"]),
+        pathFlag=d["pathFlag"],
+        pathTime=[StochasticVariableModel(**p) for p in d["pathTime"]],
+        outputNotation=d["outputNotation"],
+        pathTimeNotation=d["pathTimeNotation"],
+    )
+
+
+def ets_to_network_node(node: ETSNode) -> NetworkNode:
+    d = node.to_api_node()
+    return NetworkNode(
+        id=d["id"],
+        precNode=d["precNode"],
+        nodeTime=d["nodeTime"],
+        finishFlag=d["finishFlag"],
+        output=StochasticVariableModel(**d["output"]),
+        outputNotation=d["outputNotation"],
+        pathFlag=d["pathFlag"],
+        pathTime=[StochasticVariableModel(**p) for p in d["pathTime"]],
+        pathTimeNotation=d["pathTimeNotation"],
+    )
 
 
 def network_generator(N):
@@ -308,48 +489,34 @@ def network_generator(N):
         raise ValueError("網路至少需要2個節點(起始節點和終端節點)")
     
     # 1. 建立N個節點實體
-    network = [node(i) for i in range(N)]
-    
-    # 2. 設定所有節點的 mean_val(隨機浮點數)
+    network = [ETSNode(i) for i in range(N)]
+
     for pnode in network:
-        pnode.mean_val = random.uniform(0, 100)
-    
-    # 3. 設定起始節點(pnode)
-    # pre_node 保持為空列表 []
-    
-    # 4. 追蹤每個節點是否被其他節點引用
+        pnode.set_node_time_mean(random.uniform(0, 100))
+
     referenced_nodes = set()
-    
-    # 5. 為中間節點和終端節點設定 pre_node
+
     for i in range(1, N):
         current_node = network[i]
-        
-        # 可選擇的前驅節點範圍: 0 到 i-1
         available_nodes = list(range(i))
-        
-        # 隨機決定選擇1到3個前驅節點
         num_pre_nodes = random.randint(1, min(3, len(available_nodes)))
-        
-        # 隨機選擇前驅節點
         selected_pre_nodes = random.sample(available_nodes, num_pre_nodes)
-        current_node.pre_node = sorted(selected_pre_nodes)
-        
-        # 記錄被引用的節點
+        current_node.set_prec_node(selected_pre_nodes)
         referenced_nodes.update(selected_pre_nodes)
-    
-    # 6. 確保所有中間節點至少被引用一次
-    unreferenced_nodes = set(range(N-1)) - referenced_nodes
-    
+
+    unreferenced_nodes = set(range(N - 1)) - referenced_nodes
+
     for unreferenced_id in unreferenced_nodes:
         possible_referrers = list(range(unreferenced_id + 1, N))
-        
         if possible_referrers:
             referrer_id = random.choice(possible_referrers)
-            
-            if unreferenced_id not in network[referrer_id].pre_node:
-                network[referrer_id].pre_node.append(unreferenced_id)
-                network[referrer_id].pre_node.sort()
-    
+            referrer = network[referrer_id]
+            if unreferenced_id not in referrer.prec_node:
+                referrer.set_prec_node(referrer.prec_node + [unreferenced_id])
+
+    for pnode in network:
+        pnode.reset_runtime_state()
+
     return network
 
 
@@ -372,30 +539,43 @@ def validate_node_inputs(nodes: List[NodeInput]) -> List[str]:
     all_referenced_node_ids = set()
 
     start_node = node_by_id.get(0)
-    if start_node and start_node.previousNodes:
-        errors.append("節點 0 (起始節點) 的 Previous Nodes 必須為空。")
+    if start_node and start_node.precNode:
+        errors.append("節點 0 (起始節點) 的 Prec_Node 必須為空。")
 
     for pnode in nodes:
-        if pnode.flag is not False:
-            errors.append(f"節點 {pnode.id} 的 Flag 必須為 false。")
+        if pnode.finishFlag is not False:
+            errors.append(f"節點 {pnode.id} 的 finish_flag 必須為 false（規劃階段）。")
 
-        if pnode.output != 0.0:
-            errors.append(f"節點 {pnode.id} 的 Output 必須為 0.0。")
+        out = pnode.output.model_dump() if pnode.output else initial_stochastic()
+        if not _is_initial_stochastic(out):
+            errors.append(f"節點 {pnode.id} 的 Output 必須為初始值 [0 : 1]。")
 
-        if pnode.id != 0 and not pnode.previousNodes:
-            errors.append(f"節點 {pnode.id} (非起始節點) 至少要有一個 Previous Node。")
+        if pnode.pathFlag and any(flag != 0 for flag in pnode.pathFlag):
+            errors.append(f"節點 {pnode.id} 的 Path_Flag 必須全為 0（規劃階段）。")
 
-        if len(pnode.previousNodes) != len(set(pnode.previousNodes)):
-            errors.append(f"節點 {pnode.id} 的 Previous Nodes 不可包含重複 ID。")
+        if pnode.nodeTime < 0:
+            errors.append(f"節點 {pnode.id} 的 Node_Time 不可為負。")
 
-        for previous_id in pnode.previousNodes:
+        if pnode.id != 0 and not pnode.precNode:
+            errors.append(f"節點 {pnode.id} (非起始節點) 至少要有一個 Prec_Node。")
+
+        if len(pnode.precNode) != len(set(pnode.precNode)):
+            errors.append(f"節點 {pnode.id} 的 Prec_Node 不可包含重複 ID。")
+
+        if len(pnode.pathFlag) not in (0, len(pnode.precNode)):
+            errors.append(f"節點 {pnode.id} 的 Path_Flag 長度必須與 Prec_Node 一致。")
+
+        if len(pnode.pathTime) not in (0, len(pnode.precNode)):
+            errors.append(f"節點 {pnode.id} 的 Path_Time 長度必須與 Prec_Node 一致。")
+
+        for previous_id in pnode.precNode:
             if previous_id < 0 or previous_id not in node_by_id:
-                errors.append(f"節點 {pnode.id} 引用了不存在的 Previous Node ID {previous_id}。")
+                errors.append(f"節點 {pnode.id} 引用了不存在的 Prec_Node ID {previous_id}。")
                 continue
             if previous_id == pnode.id:
-                errors.append(f"節點 {pnode.id} 的 Previous Nodes 不可包含自己的 ID。")
+                errors.append(f"節點 {pnode.id} 的 Prec_Node 不可包含自己的 ID。")
             if previous_id == N - 1:
-                errors.append(f"節點 {pnode.id} 的 Previous Nodes 不可包含終端節點 ID ({N - 1})。")
+                errors.append(f"節點 {pnode.id} 的 Prec_Node 不可包含終端節點 ID ({N - 1})。")
             if previous_id > pnode.id:
                 errors.append(f"節點 {pnode.id} 不可引用後序節點 {previous_id}，以避免形成循環。")
             all_referenced_node_ids.add(previous_id)
@@ -421,7 +601,7 @@ def validate_draft_nodes(nodes: List[NodeInput]) -> List[str]:
 def has_cycle(nodes: List[NodeInput]) -> bool:
     graph = {pnode.id: [] for pnode in nodes}
     for pnode in nodes:
-        for previous_id in pnode.previousNodes:
+        for previous_id in pnode.precNode:
             if previous_id in graph:
                 graph[previous_id].append(pnode.id)
 
@@ -445,56 +625,59 @@ def has_cycle(nodes: List[NodeInput]) -> bool:
     return any(visit(node_id) for node_id in graph)
 
 
-def inputs_to_network(nodes: List[NodeInput]):
-    network = []
-    for pnode_data in sorted(nodes, key=lambda item: item.id):
-        pnode = node(pnode_data.id)
-        pnode.flag = pnode_data.flag
-        pnode.pre_node = sorted(pnode_data.previousNodes)
-        pnode.mean_val = float(pnode_data.meanTime)
-        pnode.output = float(pnode_data.output)
-        network.append(pnode)
-    return network
+def inputs_to_network(nodes: List[NodeInput]) -> List[ETSNode]:
+    return [node_input_to_ets(p, reset_runtime=False) for p in sorted(nodes, key=lambda item: item.id)]
 
 
-def network_to_inputs(network) -> List[NodeInput]:
-    return [
-        NodeInput(
-            id=pnode.id,
-            previousNodes=pnode.pre_node,
-            meanTime=round(pnode.mean_val, 2),
-            flag=pnode.flag,
-            output=pnode.output,
-        )
-        for pnode in network
-    ]
+def network_to_inputs(network: List[ETSNode]) -> List[NodeInput]:
+    return [ets_to_node_input(pnode) for pnode in network]
 
 
-def compact_from_node_inputs(nodes: List[NodeInput]) -> tuple[int, List[List[int]], List[float]]:
+def compact_ets_snapshot(nodes: List[NodeInput], reset_runtime: bool = True) -> dict:
     ordered = sorted(nodes, key=lambda item: item.id)
-    n = len(ordered)
-    predecessors = [list(p.previousNodes) for p in ordered]
-    mean_times = [float(p.meanTime) for p in ordered]
-    return n, predecessors, mean_times
+    ets_list = [node_input_to_ets(p, reset_runtime=reset_runtime) for p in ordered]
+    n = len(ets_list)
+    return {
+        "node_count": n,
+        "prec_nodes": [e.prec_node for e in ets_list],
+        "node_times": [e.node_time_mean for e in ets_list],
+        "finish_flags": [e.finish_flag for e in ets_list],
+        "outputs": [e.output for e in ets_list],
+        "path_flags": [e.path_flag for e in ets_list],
+        "path_times": [e.path_time for e in ets_list],
+    }
 
 
-def node_inputs_from_compact(
-    node_count: int,
-    predecessors: List[List[int]],
-    mean_times: List[float],
-) -> List[NodeInput]:
-    if len(predecessors) != node_count or len(mean_times) != node_count:
-        raise HTTPException(status_code=500, detail="儲存的網路資料長度不一致")
-    return [
-        NodeInput(
-            id=i,
-            previousNodes=list(predecessors[i]),
-            meanTime=float(mean_times[i]),
-            flag=False,
-            output=0.0,
-        )
-        for i in range(node_count)
-    ]
+def _load_json_column(raw, fallback):
+    if raw is None:
+        return fallback
+    return json.loads(raw) if isinstance(raw, str) else raw
+
+
+def ets_from_db_row(row) -> List[ETSNode]:
+    node_count = int(row["node_count"])
+    prec_nodes = _load_json_column(row.get("prec_nodes_json"), [])
+    node_times = _load_json_column(row.get("node_times_json"), [])
+    finish_flags = _load_json_column(row.get("finish_flags_json"), [False] * node_count)
+    outputs = _load_json_column(row.get("outputs_json"), default_outputs(node_count))
+    path_flags = _load_json_column(row.get("path_flags_json"), default_path_flags(prec_nodes))
+    path_times = _load_json_column(row.get("path_times_json"), default_path_times(prec_nodes))
+
+    if len(prec_nodes) != node_count or len(node_times) != node_count:
+        raise HTTPException(status_code=500, detail="儲存的 ETS 節點資料長度不一致")
+
+    nodes = ets_nodes_from_planning(node_count, prec_nodes, node_times)
+    for i, ets in enumerate(nodes):
+        ets.finish_flag = bool(finish_flags[i]) if i < len(finish_flags) else False
+        ets.output = outputs[i] if i < len(outputs) else initial_stochastic()
+        ets.path_flag = list(path_flags[i]) if i < len(path_flags) else [0] * len(ets.prec_node)
+        ets.path_time = list(path_times[i]) if i < len(path_times) else [initial_stochastic() for _ in ets.prec_node]
+        ets.sync_path_arrays()
+    return nodes
+
+
+def nodes_from_db_row(row) -> List[NodeInput]:
+    return [ets_to_node_input(n) for n in ets_from_db_row(row)]
 
 
 def row_to_saved_network_response(
@@ -502,25 +685,33 @@ def row_to_saved_network_response(
     graph_uri: Optional[str] = None,
     include_graph: bool = True,
 ) -> SavedNetworkResponse:
-    predecessors_raw = row["predecessors_json"]
-    mean_times_raw = row["mean_times_json"]
-    predecessors = json.loads(predecessors_raw) if isinstance(predecessors_raw, str) else predecessors_raw
-    mean_times = json.loads(mean_times_raw) if isinstance(mean_times_raw, str) else mean_times_raw
     node_count = int(row["node_count"])
-    nodes = node_inputs_from_compact(node_count, predecessors, mean_times)
+    nodes = nodes_from_db_row(row)
+    prec_nodes = _load_json_column(row.get("prec_nodes_json"), [])
+    node_times = _load_json_column(row.get("node_times_json"), [])
+    finish_flags = _load_json_column(row.get("finish_flags_json"), [])
+    outputs_raw = _load_json_column(row.get("outputs_json"), [])
+    path_flags = _load_json_column(row.get("path_flags_json"), [])
+    path_times_raw = _load_json_column(row.get("path_times_json"), [])
+
     if include_graph:
         if not graph_uri:
-            network = inputs_to_network(nodes)
+            network = ets_from_db_row(row)
             graph_uri = f"data:image/png;base64,{network_graph_to_base64(network)}"
     else:
         graph_uri = graph_uri or ""
+
     return SavedNetworkResponse(
         id=row["id"],
         userId=int(row["user_id"]),
         name=row["name"],
         nodeCount=node_count,
-        predecessors=predecessors,
-        meanTimes=mean_times,
+        precNodes=prec_nodes,
+        nodeTimes=node_times,
+        finishFlags=finish_flags,
+        outputs=[StochasticVariableModel(**o) for o in outputs_raw],
+        pathFlags=path_flags,
+        pathTimes=[[StochasticVariableModel(**p) for p in pt] for pt in path_times_raw],
         nodes=nodes,
         graph=graph_uri,
         passReview=bool(row.get("pass_review", 0)),
@@ -546,10 +737,18 @@ def persist_network_nodes(
     nodes: List[NodeInput],
     pass_review: bool,
     network_id: Optional[int] = None,
+    reset_runtime: bool = True,
 ) -> dict:
-    node_count, predecessors, mean_times = compact_from_node_inputs(nodes)
-    predecessors_payload = json.dumps(predecessors)
-    mean_times_payload = json.dumps(mean_times)
+    snapshot = compact_ets_snapshot(nodes, reset_runtime=reset_runtime)
+    payloads = {
+        "node_count": snapshot["node_count"],
+        "prec_nodes": json.dumps(snapshot["prec_nodes"]),
+        "node_times": json.dumps(snapshot["node_times"]),
+        "finish_flags": json.dumps(snapshot["finish_flags"]),
+        "outputs": json.dumps(snapshot["outputs"]),
+        "path_flags": json.dumps(snapshot["path_flags"]),
+        "path_times": json.dumps(snapshot["path_times"]),
+    }
     pass_review_value = 1 if pass_review else 0
 
     with connection.cursor() as cursor:
@@ -558,16 +757,24 @@ def persist_network_nodes(
                 """
                 UPDATE saved_networks
                 SET node_count = %s,
-                    predecessors_json = %s,
-                    mean_times_json = %s,
+                    prec_nodes_json = %s,
+                    node_times_json = %s,
+                    finish_flags_json = %s,
+                    outputs_json = %s,
+                    path_flags_json = %s,
+                    path_times_json = %s,
                     pass_review = %s,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s AND user_id = %s
                 """,
                 (
-                    node_count,
-                    predecessors_payload,
-                    mean_times_payload,
+                    payloads["node_count"],
+                    payloads["prec_nodes"],
+                    payloads["node_times"],
+                    payloads["finish_flags"],
+                    payloads["outputs"],
+                    payloads["path_flags"],
+                    payloads["path_times"],
                     pass_review_value,
                     network_id,
                     user_id,
@@ -582,22 +789,33 @@ def persist_network_nodes(
                 """
                 INSERT INTO saved_networks (
                     user_id, name, node_count,
-                    predecessors_json, mean_times_json, pass_review
+                    prec_nodes_json, node_times_json,
+                    finish_flags_json, outputs_json,
+                    path_flags_json, path_times_json,
+                    pass_review
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     node_count = VALUES(node_count),
-                    predecessors_json = VALUES(predecessors_json),
-                    mean_times_json = VALUES(mean_times_json),
+                    prec_nodes_json = VALUES(prec_nodes_json),
+                    node_times_json = VALUES(node_times_json),
+                    finish_flags_json = VALUES(finish_flags_json),
+                    outputs_json = VALUES(outputs_json),
+                    path_flags_json = VALUES(path_flags_json),
+                    path_times_json = VALUES(path_times_json),
                     pass_review = VALUES(pass_review),
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
                     user_id,
                     network_name,
-                    node_count,
-                    predecessors_payload,
-                    mean_times_payload,
+                    payloads["node_count"],
+                    payloads["prec_nodes"],
+                    payloads["node_times"],
+                    payloads["finish_flags"],
+                    payloads["outputs"],
+                    payloads["path_flags"],
+                    payloads["path_times"],
                     pass_review_value,
                 ),
             )
@@ -829,7 +1047,7 @@ def get_network(n: int):
         response_data = {
             'success': True,
             'nodeCount': n,
-            'nodes': [node.to_dict() for node in network],
+            'nodes': [ets_to_network_node(node).model_dump() for node in network],
             'graph': f'data:image/png;base64,{graph_base64}'
         }
         return JSONResponse(content=response_data)
@@ -921,9 +1139,7 @@ def review_network(network_id: int, request: ReviewNetworkRequest):
         migrate_schema(connection)
         ensure_user_exists(connection, request.userId)
         row = fetch_network_row(connection, network_id, request.userId)
-        predecessors = json.loads(row["predecessors_json"]) if isinstance(row["predecessors_json"], str) else row["predecessors_json"]
-        mean_times = json.loads(row["mean_times_json"]) if isinstance(row["mean_times_json"], str) else row["mean_times_json"]
-        nodes = node_inputs_from_compact(int(row["node_count"]), predecessors, mean_times)
+        nodes = nodes_from_db_row(row)
 
         errors = validate_node_inputs(nodes)
         if errors:
@@ -945,6 +1161,26 @@ def review_network(network_id: int, request: ReviewNetworkRequest):
         row = fetch_network_row(connection, network_id, request.userId)
 
     return row_to_saved_network_response(row, include_graph=False)
+
+
+@app.put("/api/python/networks/{network_id}/ets-runtime", response_model=SavedNetworkResponse)
+def update_ets_runtime(network_id: int, request: UpdateEtsRuntimeRequest):
+    """Save ETS runtime fields (finishFlag, output, pathFlag, pathTime) after analysis."""
+    with db_connection() as connection:
+        init_schema(connection)
+        migrate_schema(connection)
+        ensure_user_exists(connection, request.userId)
+        row = fetch_network_row(connection, network_id, request.userId)
+        network_row = persist_network_nodes(
+            connection,
+            request.userId,
+            row["name"],
+            request.nodes,
+            pass_review=bool(row.get("pass_review", 0)),
+            network_id=network_id,
+            reset_runtime=False,
+        )
+    return row_to_saved_network_response(network_row, include_graph=False)
 
 
 @app.get("/api/python/networks", response_model=List[SavedNetworkResponse])
@@ -1027,7 +1263,7 @@ def graph_network(request: GraphNetworkRequest):
         response_data = {
             "success": True,
             "nodeCount": len(network),
-            "nodes": [pnode.to_dict() for pnode in network],
+            "nodes": [ets_to_network_node(pnode).model_dump() for pnode in network],
             "graph": f"data:image/png;base64,{graph_base64}",
         }
         return JSONResponse(content=response_data)

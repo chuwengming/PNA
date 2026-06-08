@@ -88,7 +88,7 @@ FastAPI initializes these tables on startup (or run `db/schema.sql` on Railway):
 | `users` | Login accounts (email / Google OAuth) |
 | `saved_networks` | Persisted networks per user (`user_id` → `users.id`) |
 
-**`saved_networks` columns:** `name`, `node_count`, `predecessors_json`, `mean_times_json`, `pass_review` (must be true before **Graph Network**). Network images are generated on demand (not stored in MySQL).
+**`saved_networks` columns (ETS):** `prec_nodes_json`, `node_times_json`, `finish_flags_json`, `outputs_json`, `path_flags_json`, `path_times_json`, `pass_review`. See `docs/definitions/07-ets-node-structure.md`.
 
 **Workflow:** Create Network / Edit Network / Review Network / Graph Network / Random Generate all persist to `saved_networks`. Reload the page and use **Edit Network** to continue editing.
 

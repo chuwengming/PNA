@@ -5,32 +5,47 @@ import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 import Image from 'next/image';
 
-// 定義節點型別
+// ETS 隨機變數
+interface StochasticVariable {
+  values: number[];
+  probabilities: number[];
+  mean: number;
+  stdDev: number;
+  method: string;
+  notation?: string;
+}
+
+// ETS 節點（擴張樹節點資料結構）
 interface Node {
   id: number;
-  previousNodes: number[];
-  meanTime: number;
-  flag: boolean;
-  output: number;
+  precNode: number[];
+  nodeTime: number;
+  finishFlag: boolean;
+  output: StochasticVariable;
+  outputNotation?: string;
+  pathFlag: number[];
+  pathTime: StochasticVariable[];
+  pathTimeNotation?: string[];
 }
 
-// 定義彈出視窗中可編輯的節點型別
 interface EditableNode {
   id: number;
-  previousNodes: string;
-  meanTime: string;
-  flag: boolean;
-  output: number;
+  precNode: string;
+  nodeTime: string;
+  finishFlag: boolean;
+  outputNotation: string;
+  pathFlagDisplay: string;
+  pathTimeDisplay: string;
 }
 
-// 定義網路型別（對應 saved_networks）
 interface Network {
   id: number;
   userId?: number;
   name: string;
   nodeCount?: number;
-  predecessors?: number[][];
-  meanTimes?: number[];
+  precNodes?: number[][];
+  nodeTimes?: number[];
+  finishFlags?: boolean[];
   nodes: Node[];
   graph: string;
   passReview: boolean;
@@ -58,30 +73,55 @@ interface NetworkGenerationResponse {
   nodeCount: number;
   nodes: Array<{
     id: number;
-    pre_node: number[];
-    mean_val: number;
-    flag: boolean;
-    output: number;
+    precNode: number[];
+    nodeTime: number;
+    finishFlag: boolean;
+    output: StochasticVariable;
+    outputNotation: string;
+    pathFlag: number[];
+    pathTime: StochasticVariable[];
+    pathTimeNotation: string[];
   }>;
   graph: string;
 }
 
+const INITIAL_OUTPUT_NOTATION = '[0 : 1]';
+
+const defaultStochastic = (): StochasticVariable => ({
+  values: [0],
+  probabilities: [1],
+  mean: 0,
+  stdDev: 0,
+  method: 'initial',
+  notation: INITIAL_OUTPUT_NOTATION,
+});
+
 const editableToNode = (node: EditableNode): Node => ({
   id: node.id,
-  previousNodes: node.previousNodes.trim() === ''
+  precNode: node.precNode.trim() === ''
     ? []
-    : node.previousNodes.split(',').map((value) => parseInt(value.trim(), 10)),
-  meanTime: Number.isFinite(parseFloat(node.meanTime)) ? parseFloat(node.meanTime) : 0,
-  flag: node.flag,
-  output: node.output
+    : node.precNode.split(',').map((value) => parseInt(value.trim(), 10)),
+  nodeTime: Number.isFinite(parseFloat(node.nodeTime)) ? parseFloat(node.nodeTime) : 0,
+  finishFlag: node.finishFlag,
+  output: defaultStochastic(),
+  outputNotation: node.outputNotation,
+  pathFlag: node.pathFlagDisplay.trim() === ''
+    ? []
+    : node.pathFlagDisplay.replace(/[\[\]]/g, '').split(',').map((v) => parseInt(v.trim(), 10)).filter((v) => !Number.isNaN(v)),
+  pathTime: [],
+  pathTimeNotation: node.pathTimeDisplay.trim() === '' ? [] : node.pathTimeDisplay.split(';').map((s) => s.trim()),
 });
 
 const nodeToEditable = (node: Node): EditableNode => ({
   id: node.id,
-  previousNodes: node.previousNodes.join(', '),
-  meanTime: String(node.meanTime),
-  flag: node.flag,
-  output: node.output
+  precNode: node.precNode.join(', '),
+  nodeTime: String(node.nodeTime),
+  finishFlag: node.finishFlag,
+  outputNotation: node.outputNotation || node.output?.notation || INITIAL_OUTPUT_NOTATION,
+  pathFlagDisplay: node.pathFlag.length > 0 ? `[${node.pathFlag.join(', ')}]` : '[]',
+  pathTimeDisplay: (node.pathTimeNotation && node.pathTimeNotation.length > 0)
+    ? node.pathTimeNotation.join('; ')
+    : (node.pathTime.length > 0 ? node.pathTime.map((p) => p.notation || INITIAL_OUTPUT_NOTATION).join('; ') : '[]'),
 });
 
 const apiErrorMessage = async (response: Response) => {
@@ -278,17 +318,19 @@ export default function DashboardPage() {
     clearDisplayAreas();
     setModalNodes([{
       id: 0,
-      previousNodes: '',
-      meanTime: '',
-      flag: false,
-      output: 0.0
+      precNode: '',
+      nodeTime: '',
+      finishFlag: false,
+      outputNotation: INITIAL_OUTPUT_NOTATION,
+      pathFlagDisplay: '[]',
+      pathTimeDisplay: '[]',
     }]);
     setShowAddNodeModal(true);
   };
 
   // 處理 Modal 中節點資料的變更
   const handleModalNodeChange = (index: number, field: keyof EditableNode, value: string | number | boolean) => {
-    if (index === 0 && field === 'previousNodes') {
+    if (index === 0 && field === 'precNode') {
       // 確保第一行的 previousNodes 欄位不能被編輯
       return;
     }
@@ -301,10 +343,12 @@ export default function DashboardPage() {
   const addModalNodeRow = (index: number) => {
     const newRow: EditableNode = {
       id: modalNodes.length,
-      previousNodes: '',
-      meanTime: '',
-      flag: false,
-      output: 0.0
+      precNode: '',
+      nodeTime: '',
+      finishFlag: false,
+      outputNotation: INITIAL_OUTPUT_NOTATION,
+      pathFlagDisplay: '[]',
+      pathTimeDisplay: '[]',
     };
     const newModalNodes = [
       ...modalNodes.slice(0, index + 1),
@@ -329,9 +373,9 @@ export default function DashboardPage() {
     const remapped = modalNodes
       .filter((_, i) => i !== index)
       .map((node, newId) => {
-        const predecessors = node.previousNodes.trim() === ''
+        const predecessors = node.precNode.trim() === ''
           ? []
-          : node.previousNodes
+          : node.precNode
               .split(',')
               .map((value) => parseInt(value.trim(), 10))
               .filter((value) => !Number.isNaN(value));
@@ -343,7 +387,7 @@ export default function DashboardPage() {
         return {
           ...node,
           id: newId,
-          previousNodes: adjusted.join(', '),
+          precNode: adjusted.join(', '),
         };
       });
 
@@ -353,16 +397,17 @@ export default function DashboardPage() {
   const buildNodePayload = (sourceNodes: Node[]) =>
     sourceNodes.map((n) => ({
       id: n.id,
-      previousNodes: n.previousNodes,
-      meanTime: n.meanTime,
-      flag: n.flag,
-      output: n.output,
+      precNode: n.precNode,
+      nodeTime: n.nodeTime,
+      finishFlag: false,
+      pathFlag: [],
+      pathTime: [],
     }));
 
   const filterValidModalNodes = () =>
     modalNodes.filter((n, index) => {
       if (index === 0) return true;
-      return n.previousNodes.trim() !== '' || n.meanTime.trim() !== '';
+      return n.precNode.trim() !== '' || n.nodeTime.trim() !== '';
     });
 
   const upsertNetworkInState = (saved: Network) => {
@@ -537,12 +582,16 @@ export default function DashboardPage() {
       const data: NetworkGenerationResponse = await response.json();
       
       if (data.success) {
-        const convertedNodes: Node[] = data.nodes.map(node => ({
+        const convertedNodes: Node[] = data.nodes.map((node) => ({
           id: node.id,
-          previousNodes: node.pre_node,
-          meanTime: node.mean_val,
-          flag: node.flag,
-          output: node.output
+          precNode: node.precNode,
+          nodeTime: node.nodeTime,
+          finishFlag: node.finishFlag,
+          output: node.output,
+          outputNotation: node.outputNotation,
+          pathFlag: node.pathFlag,
+          pathTime: node.pathTime,
+          pathTimeNotation: node.pathTimeNotation,
         }));
 
         const saveResponse = await fetch('/api/python/networks/graph', {
@@ -968,20 +1017,24 @@ export default function DashboardPage() {
                     <thead>
                       <tr className="border-b border-blue-500/30">
                         <th className="py-3 px-4 text-cyan-400 font-semibold">Node ID</th>
-                        <th className="py-3 px-4 text-cyan-400 font-semibold">Previous Nodes</th>
-                        <th className="py-3 px-4 text-cyan-400 font-semibold">Mean Time</th>
-                        <th className="py-3 px-4 text-cyan-400 font-semibold">Flag</th>
+                        <th className="py-3 px-4 text-cyan-400 font-semibold">Prec Node</th>
+                        <th className="py-3 px-4 text-cyan-400 font-semibold">Node Time</th>
+                        <th className="py-3 px-4 text-cyan-400 font-semibold">Finish Flag</th>
                         <th className="py-3 px-4 text-cyan-400 font-semibold">Output</th>
+                        <th className="py-3 px-4 text-cyan-400 font-semibold">Path Flag</th>
+                        <th className="py-3 px-4 text-cyan-400 font-semibold">Path Time</th>
                       </tr>
                     </thead>
                     <tbody>
                       {nodes.map((node) => (
                         <tr key={node.id} className="border-b border-slate-700/50 hover:bg-slate-700/30">
                           <td className="py-3 px-4 text-white font-mono">{node.id}</td>
-                          <td className="py-3 px-4 text-gray-300">{node.previousNodes.length > 0 ? `[${node.previousNodes.join(', ')}]` : '[]'}</td>
-                          <td className="py-3 px-4 text-gray-300">{typeof node.meanTime === 'number' ? node.meanTime.toFixed(2) : node.meanTime}</td>
-                          <td className="py-3 px-4 text-gray-300">{node.flag.toString()}</td>
-                          <td className="py-3 px-4 text-gray-300">{node.output.toFixed(1)}</td>
+                          <td className="py-3 px-4 text-gray-300">{node.precNode.length > 0 ? `[${node.precNode.join(', ')}]` : '[]'}</td>
+                          <td className="py-3 px-4 text-gray-300">{typeof node.nodeTime === 'number' ? node.nodeTime.toFixed(2) : node.nodeTime}</td>
+                          <td className="py-3 px-4 text-gray-300">{node.finishFlag.toString()}</td>
+                          <td className="py-3 px-4 text-gray-300 text-xs">{node.outputNotation || node.output?.notation || INITIAL_OUTPUT_NOTATION}</td>
+                          <td className="py-3 px-4 text-gray-300">{node.pathFlag.length > 0 ? `[${node.pathFlag.join(', ')}]` : '[]'}</td>
+                          <td className="py-3 px-4 text-gray-300 text-xs">{(node.pathTimeNotation && node.pathTimeNotation.length > 0) ? node.pathTimeNotation.join('; ') : '[]'}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -1060,10 +1113,10 @@ export default function DashboardPage() {
                 <thead className="sticky top-0 bg-slate-800">
                   <tr className="border-b border-blue-500/30">
                     <th className="py-3 px-2 w-16 text-cyan-400 font-semibold text-sm">ID</th>
-                    <th className="py-3 px-2 w-40 text-cyan-400 font-semibold text-sm">Previous Nodes</th>
-                    <th className="py-3 px-2 w-32 text-cyan-400 font-semibold text-sm">Mean Time</th>
-                    <th className="py-3 px-2 w-24 text-cyan-400 font-semibold text-sm">Flag</th>
-                    <th className="py-3 px-2 w-24 text-cyan-400 font-semibold text-sm">Output</th>
+                    <th className="py-3 px-2 w-36 text-cyan-400 font-semibold text-sm">Prec Node</th>
+                    <th className="py-3 px-2 w-28 text-cyan-400 font-semibold text-sm">Node Time</th>
+                    <th className="py-3 px-2 w-20 text-cyan-400 font-semibold text-sm">Finish</th>
+                    <th className="py-3 px-2 w-28 text-cyan-400 font-semibold text-sm">Output</th>
                     <th className="py-3 px-2 w-24 text-cyan-400 font-semibold text-sm">Actions</th>
                   </tr>
                 </thead>
@@ -1076,8 +1129,8 @@ export default function DashboardPage() {
                           <span className="text-gray-400 pl-2">[</span>
                           <input
                             type="text"
-                            value={node.previousNodes}
-                            onChange={(e) => handleModalNodeChange(index, 'previousNodes', e.target.value)}
+                            value={node.precNode}
+                            onChange={(e) => handleModalNodeChange(index, 'precNode', e.target.value)}
                             placeholder={index === 0 ? '' : '1, 2'}
                             className="w-full px-1 py-1 bg-transparent text-white focus:outline-none"
                             disabled={index === 0}
@@ -1089,14 +1142,14 @@ export default function DashboardPage() {
                         <input
                           type="number"
                           step="0.1"
-                          value={node.meanTime}
-                          onChange={(e) => handleModalNodeChange(index, 'meanTime', e.target.value)}
+                          value={node.nodeTime}
+                          onChange={(e) => handleModalNodeChange(index, 'nodeTime', e.target.value)}
                           placeholder="0.0"
                           className="w-full px-2 py-1 bg-slate-900 border border-blue-500/30 rounded-md text-white focus:outline-none focus:border-cyan-400"
                         />
                       </td>
-                      <td className="py-2 px-2 text-gray-400">{node.flag.toString()}</td>
-                      <td className="py-2 px-2 text-gray-400">{node.output.toFixed(1)}</td>
+                      <td className="py-2 px-2 text-gray-400">{node.finishFlag.toString()}</td>
+                      <td className="py-2 px-2 text-gray-400 text-xs">{node.outputNotation}</td>
                       <td className="py-2 px-2">
                         <div className="flex items-center justify-center gap-1">
                           <button
@@ -1179,7 +1232,7 @@ export default function DashboardPage() {
                       // ID=0 的節點一定要算進去
                       if (index === 0) return true;
                       // 其他節點: 至少要有 meanTime 或 previousNodes
-                      return n.previousNodes.trim() !== '' || n.meanTime.trim() !== '';
+                      return n.precNode.trim() !== '' || n.nodeTime.trim() !== '';
                     }).length}
                   </span>
                 </p>
@@ -1323,10 +1376,10 @@ export default function DashboardPage() {
                     <thead className="sticky top-0 bg-slate-800">
                       <tr className="border-b border-blue-500/30">
                         <th className="py-3 px-2 w-16 text-cyan-400 font-semibold text-sm">ID</th>
-                        <th className="py-3 px-2 w-40 text-cyan-400 font-semibold text-sm">Previous Nodes</th>
-                        <th className="py-3 px-2 w-32 text-cyan-400 font-semibold text-sm">Mean Time</th>
-                        <th className="py-3 px-2 w-24 text-cyan-400 font-semibold text-sm">Flag</th>
-                        <th className="py-3 px-2 w-24 text-cyan-400 font-semibold text-sm">Output</th>
+                        <th className="py-3 px-2 w-36 text-cyan-400 font-semibold text-sm">Prec Node</th>
+                        <th className="py-3 px-2 w-28 text-cyan-400 font-semibold text-sm">Node Time</th>
+                        <th className="py-3 px-2 w-20 text-cyan-400 font-semibold text-sm">Finish</th>
+                        <th className="py-3 px-2 w-28 text-cyan-400 font-semibold text-sm">Output</th>
                         <th className="py-3 px-2 w-24 text-cyan-400 font-semibold text-sm">Actions</th>
                       </tr>
                     </thead>
@@ -1339,8 +1392,8 @@ export default function DashboardPage() {
                               <span className="text-gray-400 pl-2">[</span>
                               <input
                                 type="text"
-                                value={node.previousNodes}
-                                onChange={(e) => handleModalNodeChange(index, 'previousNodes', e.target.value)}
+                                value={node.precNode}
+                                onChange={(e) => handleModalNodeChange(index, 'precNode', e.target.value)}
                                 placeholder={index === 0 ? '' : '1, 2'}
                                 className="w-full px-1 py-1 bg-transparent text-white focus:outline-none"
                                 disabled={index === 0}
@@ -1352,14 +1405,14 @@ export default function DashboardPage() {
                             <input
                               type="number"
                               step="0.1"
-                              value={node.meanTime}
-                              onChange={(e) => handleModalNodeChange(index, 'meanTime', e.target.value)}
+                              value={node.nodeTime}
+                              onChange={(e) => handleModalNodeChange(index, 'nodeTime', e.target.value)}
                               placeholder="0.0"
                               className="w-full px-2 py-1 bg-slate-900 border border-blue-500/30 rounded-md text-white focus:outline-none focus:border-cyan-400"
                             />
                           </td>
-                          <td className="py-2 px-2 text-gray-400">{node.flag.toString()}</td>
-                          <td className="py-2 px-2 text-gray-400">{node.output.toFixed(1)}</td>
+                          <td className="py-2 px-2 text-gray-400">{node.finishFlag.toString()}</td>
+                          <td className="py-2 px-2 text-gray-400 text-xs">{node.outputNotation}</td>
                           <td className="py-2 px-2">
                             <div className="flex items-center justify-center gap-1">
                               <button
