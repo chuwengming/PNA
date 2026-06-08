@@ -27,6 +27,7 @@ from api.network.ets_node import (
     default_path_times,
     ets_nodes_from_planning,
 )
+from api.analysis.lcta import LCTAError, run_lcta
 from api.network.stochastic import initial_stochastic, node_time_mean, stochastic_notation
 from api.rag.config import DOCS_INDEX_FILE
 from api.rag.ingest import build_index, index_status
@@ -198,6 +199,20 @@ class UpdateEtsRuntimeRequest(BaseModel):
     """Persist algorithm runtime fields without resetting to planning defaults."""
     userId: int
     nodes: List[NodeInput]
+
+
+class RunLctaRequest(BaseModel):
+    userId: int
+
+
+class LctaAnalysisResponse(BaseModel):
+    success: bool
+    completionTime: StochasticVariableModel
+    completionTimeNotation: str
+    completionTimeMean: float
+    rootNodeId: int
+    nodes: List[NodeInput]
+    graph: str
 
 
 class SavedNetworkResponse(BaseModel):
@@ -847,9 +862,9 @@ def network_graph_to_base64(my_network):
         """計算節點所在的層級"""
         if node_id == 0:
             return 0
-        if not network[node_id].pre_node:
+        if not network[node_id].prec_node:
             return 0
-        return max(get_node_level(pre_id, network) for pre_id in network[node_id].pre_node) + 1
+        return max(get_node_level(pre_id, network) for pre_id in network[node_id].prec_node) + 1
     
     # 計算每個節點的層級
     node_levels = [get_node_level(i, my_network) for i in range(N)]
@@ -881,7 +896,7 @@ def network_graph_to_base64(my_network):
         target_id = pnode.id
         target_pos = positions[target_id]
         
-        for source_id in pnode.pre_node:
+        for source_id in pnode.prec_node:
             source_pos = positions[source_id]
             
             arrow = FancyArrowPatch(
@@ -1161,6 +1176,61 @@ def review_network(network_id: int, request: ReviewNetworkRequest):
         row = fetch_network_row(connection, network_id, request.userId)
 
     return row_to_saved_network_response(row, include_graph=False)
+
+
+@app.post("/api/python/networks/{network_id}/lcta", response_model=LctaAnalysisResponse)
+def run_lcta_analysis(network_id: int, request: RunLctaRequest):
+    """
+    Run LCTA in memory (load once → refresh ETS → trace → persist once).
+    Requires pass_review on the saved network.
+    """
+    with db_connection() as connection:
+        init_schema(connection)
+        migrate_schema(connection)
+        ensure_user_exists(connection, request.userId)
+        row = fetch_network_row(connection, network_id, request.userId)
+
+        if not bool(row.get("pass_review", 0)):
+            raise HTTPException(
+                status_code=400,
+                detail="Network must pass review before LCTA analysis",
+            )
+
+        node_count = int(row["node_count"])
+        prec_nodes = _load_json_column(row.get("prec_nodes_json"), [])
+        planning_means = _load_json_column(row.get("node_times_json"), [])
+
+        if len(prec_nodes) != node_count or len(planning_means) != node_count:
+            raise HTTPException(status_code=500, detail="儲存的 ETS 節點資料長度不一致")
+
+        nodes = ets_nodes_from_planning(node_count, prec_nodes, planning_means)
+        try:
+            result = run_lcta(nodes, planning_means=planning_means, refresh=True)
+        except LCTAError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        node_inputs = network_to_inputs(result.nodes)
+        persist_network_nodes(
+            connection,
+            request.userId,
+            row["name"],
+            node_inputs,
+            pass_review=True,
+            network_id=network_id,
+            reset_runtime=False,
+        )
+
+    graph_base64 = network_graph_to_base64(result.nodes)
+    completion = StochasticVariableModel(**result.completion_time)
+    return LctaAnalysisResponse(
+        success=True,
+        completionTime=completion,
+        completionTimeNotation=stochastic_notation(result.completion_time),
+        completionTimeMean=result.completion_mean,
+        rootNodeId=result.root_id,
+        nodes=node_inputs,
+        graph=f"data:image/png;base64,{graph_base64}",
+    )
 
 
 @app.put("/api/python/networks/{network_id}/ets-runtime", response_model=SavedNetworkResponse)

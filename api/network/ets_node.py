@@ -132,3 +132,18 @@ def default_path_flags(prec_nodes: List[List[int]]) -> List[List[int]]:
 
 def default_path_times(prec_nodes: List[List[int]]) -> List[List[Dict[str, Any]]]:
     return [[initial_stochastic() for _ in prec] for prec in prec_nodes]
+
+
+def prepare_network_for_lcta(
+    nodes: List[ETSNode],
+    planning_means: Optional[List[float]] = None,
+) -> None:
+    """
+    Reset ETS runtime fields and discretize Node_Time (Chebyshev 5-point) before LCTA.
+
+    Preserves ``prec_node``; uses ``planning_means`` when supplied, else current mean.
+    """
+    for i, node in enumerate(nodes):
+        mean = float(planning_means[i]) if planning_means is not None else node.node_time_mean
+        node.reset_runtime_state()
+        node.set_node_time_mean(mean)

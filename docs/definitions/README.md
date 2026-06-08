@@ -14,6 +14,7 @@
 | 05 | [05-max-operation.md](./05-max-operation.md) | Max 運算（兩隨機變數取最大值） |
 | 06 | [06-resample.md](./06-resample.md) | 離散化重新取樣（支撐點減肥） |
 | 07 | [07-ets-node-structure.md](./07-ets-node-structure.md) | ETS 擴張樹節點資料結構 |
+| 08 | [08-lcta-path-dependency.md](./08-lcta-path-dependency.md) | LCTA 路徑相依性與修正原理 |
 
 ## 使用約定
 

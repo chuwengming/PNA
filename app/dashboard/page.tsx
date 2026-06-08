@@ -87,6 +87,173 @@ interface NetworkGenerationResponse {
 
 const INITIAL_OUTPUT_NOTATION = '[0 : 1]';
 
+interface LctaAnalysisResult {
+  networkName: string;
+  mean: number;
+  variance: number;
+  values: number[];
+  probabilities: number[];
+  notation: string;
+}
+
+const computeDistributionVariance = (
+  values: number[],
+  probabilities: number[],
+  mean: number,
+): number => {
+  if (values.length === 0) return 0;
+  return values.reduce((acc, value, index) => {
+    const p = probabilities[index] ?? 0;
+    return acc + p * (value - mean) ** 2;
+  }, 0);
+};
+
+function CompletionTimePdfChart({
+  values,
+  probabilities,
+}: {
+  values: number[];
+  probabilities: number[];
+}) {
+  const width = 720;
+  const height = 320;
+  const margin = { top: 24, right: 28, bottom: 48, left: 56 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+
+  if (values.length === 0) {
+    return <p className="text-gray-500 text-sm">No distribution data.</p>;
+  }
+
+  const xMin = Math.min(...values);
+  const xMax = Math.max(...values);
+  const yMax = Math.max(...probabilities, 0.001);
+  const xSpan = xMax - xMin || 1;
+
+  const toX = (v: number) => margin.left + ((v - xMin) / xSpan) * plotWidth;
+  const toY = (p: number) => margin.top + plotHeight - (p / yMax) * plotHeight;
+
+  const points = values.map((v, i) => `${toX(v)},${toY(probabilities[i] ?? 0)}`);
+  const polyline = points.join(' ');
+
+  const yTicks = [0, yMax * 0.25, yMax * 0.5, yMax * 0.75, yMax];
+  const xTickCount = Math.min(6, values.length);
+  const xTicks = Array.from({ length: xTickCount }, (_, i) => {
+    if (xTickCount === 1) return xMin;
+    return xMin + (xSpan * i) / (xTickCount - 1);
+  });
+
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      className="w-full h-auto max-h-[360px]"
+      role="img"
+      aria-label="Network completion time probability distribution"
+    >
+      <rect x={0} y={0} width={width} height={height} fill="transparent" />
+
+      {yTicks.map((tick) => (
+        <g key={`y-${tick}`}>
+          <line
+            x1={margin.left}
+            y1={toY(tick)}
+            x2={width - margin.right}
+            y2={toY(tick)}
+            stroke="rgba(148, 163, 184, 0.2)"
+            strokeDasharray="4 4"
+          />
+          <text
+            x={margin.left - 8}
+            y={toY(tick) + 4}
+            textAnchor="end"
+            fill="#94a3b8"
+            fontSize={11}
+          >
+            {tick.toFixed(3)}
+          </text>
+        </g>
+      ))}
+
+      <line
+        x1={margin.left}
+        y1={margin.top + plotHeight}
+        x2={width - margin.right}
+        y2={margin.top + plotHeight}
+        stroke="#64748b"
+      />
+      <line
+        x1={margin.left}
+        y1={margin.top}
+        x2={margin.left}
+        y2={margin.top + plotHeight}
+        stroke="#64748b"
+      />
+
+      {xTicks.map((tick) => (
+        <g key={`x-${tick}`}>
+          <line
+            x1={toX(tick)}
+            y1={margin.top + plotHeight}
+            x2={toX(tick)}
+            y2={margin.top + plotHeight + 6}
+            stroke="#64748b"
+          />
+          <text
+            x={toX(tick)}
+            y={margin.top + plotHeight + 22}
+            textAnchor="middle"
+            fill="#94a3b8"
+            fontSize={11}
+          >
+            {tick.toFixed(1)}
+          </text>
+        </g>
+      ))}
+
+      <polyline
+        points={polyline}
+        fill="none"
+        stroke="#22d3ee"
+        strokeWidth={2.5}
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+
+      {values.map((v, i) => (
+        <circle
+          key={`pt-${i}`}
+          cx={toX(v)}
+          cy={toY(probabilities[i] ?? 0)}
+          r={4}
+          fill="#f59e0b"
+          stroke="#0f172a"
+          strokeWidth={1.5}
+        />
+      ))}
+
+      <text
+        x={width / 2}
+        y={height - 6}
+        textAnchor="middle"
+        fill="#cbd5e1"
+        fontSize={12}
+      >
+        Completion time T
+      </text>
+      <text
+        x={14}
+        y={height / 2}
+        textAnchor="middle"
+        fill="#cbd5e1"
+        fontSize={12}
+        transform={`rotate(-90 14 ${height / 2})`}
+      >
+        P(T)
+      </text>
+    </svg>
+  );
+}
+
 const defaultStochastic = (): StochasticVariable => ({
   values: [0],
   probabilities: [1],
@@ -184,6 +351,8 @@ export default function DashboardPage() {
   const [selectedReviewedNetwork, setSelectedReviewedNetwork] = useState<string>('');
   const [graphNetworkName, setGraphNetworkName] = useState<string>('');
   const [isGraphing, setIsGraphing] = useState<boolean>(false);
+  const [isRunningLcta, setIsRunningLcta] = useState<boolean>(false);
+  const [lctaAnalysis, setLctaAnalysis] = useState<LctaAnalysisResult | null>(null);
   const [resolvedUserId, setResolvedUserId] = useState<number | null>(null);
   const [isResolvingDbUser, setIsResolvingDbUser] = useState(false);
 
@@ -307,6 +476,7 @@ export default function DashboardPage() {
   const clearDisplayAreas = () => {
     setNodes([]);
     setNetworkGraph('');
+    setLctaAnalysis(null);
   };
 
   const handleSignOut = async () => {
@@ -510,9 +680,73 @@ export default function DashboardPage() {
     }
   };
 
+  const handleRunLcta = async () => {
+    if (!selectedNetwork) {
+      alert('Please select a reviewed network for LCTA analysis.');
+      return;
+    }
+    if (!hasDbUser) {
+      alert('Please sign in with a database-backed account.');
+      return;
+    }
+
+    const networkId = Number(selectedNetwork);
+    const network = reviewedNetworks.find((n) => n.id === networkId);
+    if (!network) {
+      alert('Selected network not found.');
+      return;
+    }
+
+    setIsRunningLcta(true);
+    setLctaAnalysis(null);
+    setGenerationError('');
+
+    try {
+      const response = await fetch(`/api/python/networks/${networkId}/lcta`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: effectiveUserId }),
+      });
+
+      if (!response.ok) {
+        throw new Error(await apiErrorMessage(response));
+      }
+
+      const data = await response.json();
+      const completion = data.completionTime as StochasticVariable;
+      const values = (completion?.values ?? []).map((v: number) => Number(v));
+      const probabilities = (completion?.probabilities ?? []).map((p: number) => Number(p));
+      const mean = typeof data.completionTimeMean === 'number'
+        ? data.completionTimeMean
+        : Number(completion?.mean ?? 0);
+      const variance = computeDistributionVariance(values, probabilities, mean);
+
+      setLctaAnalysis({
+        networkName: network.name,
+        mean,
+        variance,
+        values,
+        probabilities,
+        notation: data.completionTimeNotation ?? completion?.notation ?? '',
+      });
+
+      if (data.graph) {
+        setNetworkGraph(data.graph);
+      }
+
+      await reloadNetworks();
+    } catch (error) {
+      console.error('LCTA analysis failed:', error);
+      alert(error instanceof Error ? error.message : 'LCTA analysis failed.');
+    } finally {
+      setIsRunningLcta(false);
+    }
+  };
+
   // 選擇網路（分析區顯示）
   const handleSelectNetwork = async (networkId: string) => {
     setSelectedNetwork(networkId);
+    setLctaAnalysis(null);
     const network = reviewedNetworks.find((n) => String(n.id) === networkId);
     if (!network) return;
 
@@ -980,13 +1214,26 @@ export default function DashboardPage() {
                   Total Path Number
                 </button>
                 <button
-                  onClick={clearDisplayAreas}
-                  className="w-full px-4 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium text-sm flex items-center justify-center"
+                  onClick={handleRunLcta}
+                  disabled={!selectedNetwork || isRunningLcta || !hasDbUser}
+                  className="w-full px-4 py-3 bg-gradient-to-r from-amber-500 to-orange-500 text-white rounded-lg hover:from-amber-600 hover:to-orange-600 transition-all font-medium text-sm flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                  Network Completion Time
+                  {isRunningLcta ? (
+                    <>
+                      <svg className="animate-spin w-4 h-4 mr-2" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                      Running LCTA...
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      Network Completion Time (LCTA)
+                    </>
+                  )}
                 </button>
               </div>
             </div>
@@ -1003,8 +1250,8 @@ export default function DashboardPage() {
                 本機與線上為<strong>不同資料庫</strong>，在本機建立的 network 不會自動出現在 Railway。
               </div>
             )}
-            {/* Current Nodes Table */}
-            {nodes.length > 0 && (
+            {/* Current Nodes Table (hidden after LCTA — per-node outputs not shown) */}
+            {nodes.length > 0 && !lctaAnalysis && (
               <div className="bg-slate-800/50 backdrop-blur-sm rounded-xl p-6 border border-blue-500/30">
                 <h2 className="text-2xl font-bold text-white mb-4 flex items-center">
                   <svg className="w-6 h-6 mr-2 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1089,14 +1336,64 @@ export default function DashboardPage() {
                 </svg>
                 Analysis Results
               </h2>
-              <div className="bg-slate-900/50 rounded-lg p-8 min-h-64 flex items-center justify-center border-2 border-dashed border-blue-500/30">
-                <div className="text-center">
-                  <svg className="w-16 h-16 text-gray-600 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                  </svg>
-                  <p className="text-gray-400 text-lg mb-2">Analyze the Selected Network</p>
-                  <p className="text-gray-500 text-sm">The analysis results will be displayed here</p>
-                </div>
+              <div className="bg-slate-900/50 rounded-lg p-6 min-h-64 border-2 border-dashed border-blue-500/30">
+                {isRunningLcta ? (
+                  <div className="flex flex-col items-center justify-center py-16 text-center">
+                    <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-amber-400 mb-4" />
+                    <p className="text-gray-400">Running LCTA analysis...</p>
+                  </div>
+                ) : lctaAnalysis ? (
+                  <div className="space-y-6">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <span className="px-3 py-1 rounded-full bg-amber-500/20 text-amber-300 text-sm border border-amber-500/30">
+                        LCTA — {lctaAnalysis.networkName}
+                      </span>
+                      <span className="text-gray-500 text-sm">
+                        {lctaAnalysis.values.length} discrete support points
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div className="rounded-lg bg-slate-800/80 border border-cyan-500/20 p-4">
+                        <p className="text-sm text-gray-400 mb-1">Expected completion time E[T]</p>
+                        <p className="text-3xl font-bold text-cyan-300 tabular-nums">
+                          {lctaAnalysis.mean.toFixed(2)}
+                        </p>
+                      </div>
+                      <div className="rounded-lg bg-slate-800/80 border border-amber-500/20 p-4">
+                        <p className="text-sm text-gray-400 mb-1">Variance Var(T)</p>
+                        <p className="text-3xl font-bold text-amber-300 tabular-nums">
+                          {lctaAnalysis.variance.toFixed(4)}
+                        </p>
+                        <p className="text-xs text-gray-500 mt-1">
+                          σ ≈ {Math.sqrt(lctaAnalysis.variance).toFixed(4)}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div>
+                      <h3 className="text-white font-semibold mb-3">
+                        Completion time probability distribution P(T)
+                      </h3>
+                      <div className="rounded-lg bg-slate-950/60 border border-slate-700/50 p-4">
+                        <CompletionTimePdfChart
+                          values={lctaAnalysis.values}
+                          probabilities={lctaAnalysis.probabilities}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center py-12 text-center">
+                    <svg className="w-16 h-16 text-gray-600 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    <p className="text-gray-400 text-lg mb-2">Analyze the Selected Network</p>
+                    <p className="text-gray-500 text-sm">
+                      Run <span className="text-amber-300">Network Completion Time (LCTA)</span> to see results here
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
           </div>

@@ -58,3 +58,20 @@ def stochastic_notation(data: Dict[str, Any]) -> str:
 
 def node_time_mean(data: Dict[str, Any]) -> float:
     return float(data.get("mean", 0.0))
+
+
+def mu_stochastic(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Strip variance: μ(Output) → [E(Output) : 1] per LCTA path-dependency correction.
+    """
+    expected = stochastic_from_dict(data).expected_value()
+    if abs(expected) <= 1e-9:
+        return initial_stochastic()
+    return {
+        "values": [expected],
+        "probabilities": [1.0],
+        "mean": expected,
+        "stdDev": 0.0,
+        "method": "mu_stripped",
+        "notation": f"[{expected:g} : 1]",
+    }
