@@ -23,12 +23,21 @@ from api.network.ets_node import (
     ETSNode,
     create_ets_node,
     default_outputs,
-    default_path_flags,
-    default_path_times,
     ets_nodes_from_planning,
 )
 from api.analysis.lcta import LCTAError, run_lcta
-from api.network.stochastic import initial_stochastic, node_time_mean, stochastic_notation
+from api.network.stochastic import (
+    compact_output_from_dict,
+    compact_output_notation,
+    default_compact_output,
+    distribution_variance,
+    initial_stochastic,
+    is_initial_compact_output,
+    node_time_mean,
+    stochastic_from_dict,
+    stochastic_notation,
+    stochastic_to_dict,
+)
 from api.rag.config import DOCS_INDEX_FILE
 from api.rag.ingest import build_index, index_status
 from api.rag.query import GenerationError, GenerationQuotaError, answer_question
@@ -109,18 +118,30 @@ class StochasticVariableModel(BaseModel):
     notation: Optional[str] = None
 
 
+class OutputSummaryModel(BaseModel):
+    """Persisted Output_i: [E(Output_i), Var(Output_i)]."""
+    mean: float = 0.0
+    variance: float = 0.0
+
+
+class LctaResultModel(BaseModel):
+    """LCTA network completion time PDF (linked to saved network)."""
+    rootNodeId: int
+    mean: float
+    variance: float
+    values: List[float]
+    probabilities: List[float]
+    notation: Optional[str] = None
+
+
 class NodeInput(BaseModel):
     """ETS node — API / frontend payload (see docs/definitions/07-ets-node-structure.md)."""
     id: int = Field(ge=0)
     precNode: List[int] = Field(default_factory=list)
     nodeTime: float = 0.0
     finishFlag: bool = False
-    output: Optional[StochasticVariableModel] = None
-    pathFlag: List[int] = Field(default_factory=list)
-    pathTime: List[StochasticVariableModel] = Field(default_factory=list)
-    # Display helpers (optional, from API responses)
+    output: Optional[OutputSummaryModel] = None
     outputNotation: Optional[str] = None
-    pathTimeNotation: Optional[List[str]] = None
 
 
 class GraphNetworkRequest(BaseModel):
@@ -138,11 +159,8 @@ class NetworkNode(BaseModel):
     precNode: List[int]
     nodeTime: float
     finishFlag: bool
-    output: StochasticVariableModel
+    output: OutputSummaryModel
     outputNotation: str
-    pathFlag: List[int]
-    pathTime: List[StochasticVariableModel]
-    pathTimeNotation: List[str]
 
 class NetworkResponse(BaseModel):
     success: bool
@@ -207,10 +225,12 @@ class RunLctaRequest(BaseModel):
 
 class LctaAnalysisResponse(BaseModel):
     success: bool
+    cached: bool = False
     completionTime: StochasticVariableModel
     completionTimeNotation: str
     completionTimeMean: float
     rootNodeId: int
+    lctaResult: LctaResultModel
     nodes: List[NodeInput]
     graph: str
 
@@ -224,9 +244,8 @@ class SavedNetworkResponse(BaseModel):
     precNodes: List[List[int]]
     nodeTimes: List[float]
     finishFlags: List[bool]
-    outputs: List[StochasticVariableModel]
-    pathFlags: List[List[int]]
-    pathTimes: List[List[StochasticVariableModel]]
+    outputs: List[OutputSummaryModel]
+    lctaResult: Optional[LctaResultModel] = None
     nodes: List[NodeInput]
     graph: str
     passReview: bool
@@ -272,8 +291,7 @@ def init_schema(connection):
                 node_times_json JSON NOT NULL,
                 finish_flags_json JSON NOT NULL,
                 outputs_json JSON NOT NULL,
-                path_flags_json JSON NOT NULL,
-                path_times_json JSON NOT NULL,
+                lcta_result_json JSON NULL,
                 pass_review TINYINT(1) NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -370,12 +388,7 @@ def migrate_schema(connection):
                     "ALTER TABLE saved_networks ADD COLUMN node_times_json JSON NOT NULL"
                 )
 
-        for col, default_expr in [
-            ("finish_flags_json", "'[]'"),
-            ("outputs_json", "'[]'"),
-            ("path_flags_json", "'[]'"),
-            ("path_times_json", "'[]'"),
-        ]:
+        for col in ("finish_flags_json", "outputs_json"):
             cursor.execute(
                 """
                 SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS
@@ -390,48 +403,64 @@ def migrate_schema(connection):
                     f"ALTER TABLE saved_networks ADD COLUMN {col} JSON NOT NULL"
                 )
 
-        # Backfill ETS runtime columns for legacy rows
-        cursor.execute("SELECT id, node_count, prec_nodes_json, node_times_json FROM saved_networks")
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'saved_networks'
+              AND COLUMN_NAME = 'lcta_result_json'
+            """
+        )
+        if cursor.fetchone()["cnt"] == 0:
+            cursor.execute(
+                "ALTER TABLE saved_networks ADD COLUMN lcta_result_json JSON NULL"
+            )
+
+        # Backfill / normalize ETS columns; convert outputs to compact [E, Var]
+        cursor.execute(
+            "SELECT id, node_count, prec_nodes_json, outputs_json, finish_flags_json FROM saved_networks"
+        )
         for row in cursor.fetchall():
             n = int(row["node_count"])
-            prec_raw = row["prec_nodes_json"]
-            prec = json.loads(prec_raw) if isinstance(prec_raw, str) else prec_raw
-            cursor.execute(
-                """
-                SELECT finish_flags_json, outputs_json, path_flags_json, path_times_json
-                FROM saved_networks WHERE id = %s
-                """,
-                (row["id"],),
-            )
-            ets_row = cursor.fetchone()
-            finish_raw = ets_row["finish_flags_json"]
-            finish = json.loads(finish_raw) if isinstance(finish_raw, str) else finish_raw
+            finish_raw = row.get("finish_flags_json")
+            finish = json.loads(finish_raw) if isinstance(finish_raw, str) else (finish_raw or [])
             if not finish or len(finish) != n:
                 cursor.execute(
                     "UPDATE saved_networks SET finish_flags_json = %s WHERE id = %s",
                     (json.dumps([False] * n), row["id"]),
                 )
-            outputs_raw = ets_row["outputs_json"]
-            outputs = json.loads(outputs_raw) if isinstance(outputs_raw, str) else outputs_raw
-            if not outputs or len(outputs) != n:
+
+            outputs_raw = row.get("outputs_json")
+            outputs = json.loads(outputs_raw) if isinstance(outputs_raw, str) else (outputs_raw or [])
+            compact_outputs = []
+            needs_update = not outputs or len(outputs) != n
+            for i in range(n):
+                if i < len(outputs) and isinstance(outputs[i], dict):
+                    compact_outputs.append(compact_output_from_dict(outputs[i]))
+                else:
+                    compact_outputs.append(default_compact_output())
+                    needs_update = True
+                if i < len(outputs) and isinstance(outputs[i], dict):
+                    if "values" in outputs[i]:
+                        needs_update = True
+            if needs_update:
                 cursor.execute(
                     "UPDATE saved_networks SET outputs_json = %s WHERE id = %s",
-                    (json.dumps(default_outputs(n)), row["id"]),
+                    (json.dumps(compact_outputs), row["id"]),
                 )
-            pf_raw = ets_row["path_flags_json"]
-            pf = json.loads(pf_raw) if isinstance(pf_raw, str) else pf_raw
-            if not pf or len(pf) != n:
-                cursor.execute(
-                    "UPDATE saved_networks SET path_flags_json = %s WHERE id = %s",
-                    (json.dumps(default_path_flags(prec)), row["id"]),
-                )
-            pt_raw = ets_row["path_times_json"]
-            pt = json.loads(pt_raw) if isinstance(pt_raw, str) else pt_raw
-            if not pt or len(pt) != n:
-                cursor.execute(
-                    "UPDATE saved_networks SET path_times_json = %s WHERE id = %s",
-                    (json.dumps(default_path_times(prec)), row["id"]),
-                )
+
+        for legacy_col in ("path_flags_json", "path_times_json"):
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'saved_networks'
+                  AND COLUMN_NAME = %s
+                """,
+                (legacy_col,),
+            )
+            if cursor.fetchone()["cnt"]:
+                cursor.execute(f"ALTER TABLE saved_networks DROP COLUMN {legacy_col}")
 
 
 @app.on_event("startup")
@@ -444,12 +473,8 @@ def startup():
         init_schema(connection)
         migrate_schema(connection)
 
-def _is_initial_stochastic(data: dict) -> bool:
-    return (
-        abs(float(data.get("mean", 0.0))) <= 1e-9
-        and len(data.get("values", [])) == 1
-        and abs(float(data["values"][0])) <= 1e-9
-    )
+def _is_initial_output(data: dict) -> bool:
+    return is_initial_compact_output(data)
 
 
 def node_input_to_ets(data: NodeInput, reset_runtime: bool = False) -> ETSNode:
@@ -459,43 +484,89 @@ def node_input_to_ets(data: NodeInput, reset_runtime: bool = False) -> ETSNode:
         return node
     node.finish_flag = bool(data.finishFlag)
     if data.output is not None:
-        node.output = data.output.model_dump()
-    node.sync_path_arrays()
-    if data.pathFlag:
-        node.path_flag = list(data.pathFlag)[: len(node.prec_node)]
-    if data.pathTime:
-        node.path_time = [p.model_dump() for p in data.pathTime[: len(node.prec_node)]]
+        node.output = compact_output_from_dict(data.output.model_dump())
     node.sync_path_arrays()
     return node
 
 
 def ets_to_node_input(node: ETSNode) -> NodeInput:
-    d = node.to_api_node()
+    d = node.to_api_node(compact_output=True)
     return NodeInput(
         id=d["id"],
         precNode=d["precNode"],
         nodeTime=d["nodeTime"],
         finishFlag=d["finishFlag"],
-        output=StochasticVariableModel(**d["output"]),
-        pathFlag=d["pathFlag"],
-        pathTime=[StochasticVariableModel(**p) for p in d["pathTime"]],
+        output=OutputSummaryModel(**d["output"]),
         outputNotation=d["outputNotation"],
-        pathTimeNotation=d["pathTimeNotation"],
     )
 
 
 def ets_to_network_node(node: ETSNode) -> NetworkNode:
-    d = node.to_api_node()
+    d = node.to_api_node(compact_output=True)
     return NetworkNode(
         id=d["id"],
         precNode=d["precNode"],
         nodeTime=d["nodeTime"],
         finishFlag=d["finishFlag"],
-        output=StochasticVariableModel(**d["output"]),
+        output=OutputSummaryModel(**d["output"]),
         outputNotation=d["outputNotation"],
-        pathFlag=d["pathFlag"],
-        pathTime=[StochasticVariableModel(**p) for p in d["pathTime"]],
-        pathTimeNotation=d["pathTimeNotation"],
+    )
+
+
+def _parse_lcta_result(row) -> Optional[LctaResultModel]:
+    raw = row.get("lcta_result_json")
+    if raw is None:
+        return None
+    data = json.loads(raw) if isinstance(raw, str) else raw
+    if not data:
+        return None
+    return LctaResultModel(**data)
+
+
+def _build_lcta_result_payload(result) -> dict:
+    ct = result.completion_time
+    values = list(ct["values"])
+    probabilities = list(ct["probabilities"])
+    mean = float(result.completion_mean)
+    variance = distribution_variance(values, probabilities, mean)
+    return {
+        "rootNodeId": int(result.root_id),
+        "mean": mean,
+        "variance": variance,
+        "values": values,
+        "probabilities": probabilities,
+        "notation": stochastic_notation(ct),
+    }
+
+
+def _lcta_response_from_cache(row) -> LctaAnalysisResponse:
+    """Return saved LCTA results without re-running the algorithm."""
+    lcta = _parse_lcta_result(row)
+    if lcta is None:
+        raise HTTPException(status_code=404, detail="No saved LCTA result for this network")
+
+    node_inputs = nodes_from_db_row(row)
+    network = ets_from_db_row(row)
+    graph_base64 = network_graph_to_base64(network)
+    notation = lcta.notation or compact_output_notation(lcta.mean, lcta.variance)
+    completion = StochasticVariableModel(
+        values=list(lcta.values),
+        probabilities=list(lcta.probabilities),
+        mean=lcta.mean,
+        stdDev=float(lcta.variance**0.5),
+        method="lcta_cached",
+        notation=notation,
+    )
+    return LctaAnalysisResponse(
+        success=True,
+        cached=True,
+        completionTime=completion,
+        completionTimeNotation=notation,
+        completionTimeMean=lcta.mean,
+        rootNodeId=lcta.rootNodeId,
+        lctaResult=lcta,
+        nodes=node_inputs,
+        graph=f"data:image/png;base64,{graph_base64}",
     )
 
 
@@ -561,12 +632,9 @@ def validate_node_inputs(nodes: List[NodeInput]) -> List[str]:
         if pnode.finishFlag is not False:
             errors.append(f"節點 {pnode.id} 的 finish_flag 必須為 false（規劃階段）。")
 
-        out = pnode.output.model_dump() if pnode.output else initial_stochastic()
-        if not _is_initial_stochastic(out):
-            errors.append(f"節點 {pnode.id} 的 Output 必須為初始值 [0 : 1]。")
-
-        if pnode.pathFlag and any(flag != 0 for flag in pnode.pathFlag):
-            errors.append(f"節點 {pnode.id} 的 Path_Flag 必須全為 0（規劃階段）。")
+        out = pnode.output.model_dump() if pnode.output else default_compact_output()
+        if not _is_initial_output(out):
+            errors.append(f"節點 {pnode.id} 的 Output 必須為初始值 [E: 0, Var: 0]。")
 
         if pnode.nodeTime < 0:
             errors.append(f"節點 {pnode.id} 的 Node_Time 不可為負。")
@@ -576,12 +644,6 @@ def validate_node_inputs(nodes: List[NodeInput]) -> List[str]:
 
         if len(pnode.precNode) != len(set(pnode.precNode)):
             errors.append(f"節點 {pnode.id} 的 Prec_Node 不可包含重複 ID。")
-
-        if len(pnode.pathFlag) not in (0, len(pnode.precNode)):
-            errors.append(f"節點 {pnode.id} 的 Path_Flag 長度必須與 Prec_Node 一致。")
-
-        if len(pnode.pathTime) not in (0, len(pnode.precNode)):
-            errors.append(f"節點 {pnode.id} 的 Path_Time 長度必須與 Prec_Node 一致。")
 
         for previous_id in pnode.precNode:
             if previous_id < 0 or previous_id not in node_by_id:
@@ -652,14 +714,18 @@ def compact_ets_snapshot(nodes: List[NodeInput], reset_runtime: bool = True) -> 
     ordered = sorted(nodes, key=lambda item: item.id)
     ets_list = [node_input_to_ets(p, reset_runtime=reset_runtime) for p in ordered]
     n = len(ets_list)
+    if reset_runtime:
+        finish_flags = [False] * n
+        outputs = [default_compact_output() for _ in range(n)]
+    else:
+        finish_flags = [e.finish_flag for e in ets_list]
+        outputs = [compact_output_from_dict(e.output) for e in ets_list]
     return {
         "node_count": n,
         "prec_nodes": [e.prec_node for e in ets_list],
         "node_times": [e.node_time_mean for e in ets_list],
-        "finish_flags": [e.finish_flag for e in ets_list],
-        "outputs": [e.output for e in ets_list],
-        "path_flags": [e.path_flag for e in ets_list],
-        "path_times": [e.path_time for e in ets_list],
+        "finish_flags": finish_flags,
+        "outputs": outputs,
     }
 
 
@@ -675,8 +741,6 @@ def ets_from_db_row(row) -> List[ETSNode]:
     node_times = _load_json_column(row.get("node_times_json"), [])
     finish_flags = _load_json_column(row.get("finish_flags_json"), [False] * node_count)
     outputs = _load_json_column(row.get("outputs_json"), default_outputs(node_count))
-    path_flags = _load_json_column(row.get("path_flags_json"), default_path_flags(prec_nodes))
-    path_times = _load_json_column(row.get("path_times_json"), default_path_times(prec_nodes))
 
     if len(prec_nodes) != node_count or len(node_times) != node_count:
         raise HTTPException(status_code=500, detail="儲存的 ETS 節點資料長度不一致")
@@ -684,9 +748,10 @@ def ets_from_db_row(row) -> List[ETSNode]:
     nodes = ets_nodes_from_planning(node_count, prec_nodes, node_times)
     for i, ets in enumerate(nodes):
         ets.finish_flag = bool(finish_flags[i]) if i < len(finish_flags) else False
-        ets.output = outputs[i] if i < len(outputs) else initial_stochastic()
-        ets.path_flag = list(path_flags[i]) if i < len(path_flags) else [0] * len(ets.prec_node)
-        ets.path_time = list(path_times[i]) if i < len(path_times) else [initial_stochastic() for _ in ets.prec_node]
+        if i < len(outputs) and isinstance(outputs[i], dict):
+            ets.output = compact_output_from_dict(outputs[i])
+        else:
+            ets.output = default_compact_output()
         ets.sync_path_arrays()
     return nodes
 
@@ -706,8 +771,7 @@ def row_to_saved_network_response(
     node_times = _load_json_column(row.get("node_times_json"), [])
     finish_flags = _load_json_column(row.get("finish_flags_json"), [])
     outputs_raw = _load_json_column(row.get("outputs_json"), [])
-    path_flags = _load_json_column(row.get("path_flags_json"), [])
-    path_times_raw = _load_json_column(row.get("path_times_json"), [])
+    lcta_result = _parse_lcta_result(row)
 
     if include_graph:
         if not graph_uri:
@@ -724,9 +788,8 @@ def row_to_saved_network_response(
         precNodes=prec_nodes,
         nodeTimes=node_times,
         finishFlags=finish_flags,
-        outputs=[StochasticVariableModel(**o) for o in outputs_raw],
-        pathFlags=path_flags,
-        pathTimes=[[StochasticVariableModel(**p) for p in pt] for pt in path_times_raw],
+        outputs=[OutputSummaryModel(**compact_output_from_dict(o)) for o in outputs_raw],
+        lctaResult=lcta_result,
         nodes=nodes,
         graph=graph_uri,
         passReview=bool(row.get("pass_review", 0)),
@@ -753,17 +816,51 @@ def persist_network_nodes(
     pass_review: bool,
     network_id: Optional[int] = None,
     reset_runtime: bool = True,
+    lcta_result: Optional[dict] = None,
+    preserve_analysis: bool = False,
 ) -> dict:
     snapshot = compact_ets_snapshot(nodes, reset_runtime=reset_runtime)
+    if preserve_analysis and network_id is not None:
+        existing = fetch_network_row(connection, network_id, user_id)
+        node_count = int(snapshot["node_count"])
+        snapshot["finish_flags"] = _load_json_column(
+            existing.get("finish_flags_json"), [False] * node_count
+        )
+        snapshot["outputs"] = _load_json_column(
+            existing.get("outputs_json"), default_outputs(node_count)
+        )
+
     payloads = {
         "node_count": snapshot["node_count"],
         "prec_nodes": json.dumps(snapshot["prec_nodes"]),
         "node_times": json.dumps(snapshot["node_times"]),
         "finish_flags": json.dumps(snapshot["finish_flags"]),
         "outputs": json.dumps(snapshot["outputs"]),
-        "path_flags": json.dumps(snapshot["path_flags"]),
-        "path_times": json.dumps(snapshot["path_times"]),
     }
+    if lcta_result is not None:
+        lcta_json = json.dumps(lcta_result)
+    elif reset_runtime and not preserve_analysis:
+        lcta_json = None
+    elif preserve_analysis and network_id is not None:
+        existing = fetch_network_row(connection, network_id, user_id)
+        raw = existing.get("lcta_result_json")
+        if raw is None:
+            lcta_json = None
+        elif isinstance(raw, str):
+            lcta_json = raw
+        else:
+            lcta_json = json.dumps(raw)
+    elif network_id is not None:
+        existing = fetch_network_row(connection, network_id, user_id)
+        raw = existing.get("lcta_result_json")
+        if raw is None:
+            lcta_json = None
+        elif isinstance(raw, str):
+            lcta_json = raw
+        else:
+            lcta_json = json.dumps(raw)
+    else:
+        lcta_json = None
     pass_review_value = 1 if pass_review else 0
 
     with connection.cursor() as cursor:
@@ -776,8 +873,7 @@ def persist_network_nodes(
                     node_times_json = %s,
                     finish_flags_json = %s,
                     outputs_json = %s,
-                    path_flags_json = %s,
-                    path_times_json = %s,
+                    lcta_result_json = %s,
                     pass_review = %s,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s AND user_id = %s
@@ -788,8 +884,7 @@ def persist_network_nodes(
                     payloads["node_times"],
                     payloads["finish_flags"],
                     payloads["outputs"],
-                    payloads["path_flags"],
-                    payloads["path_times"],
+                    lcta_json,
                     pass_review_value,
                     network_id,
                     user_id,
@@ -806,18 +901,16 @@ def persist_network_nodes(
                     user_id, name, node_count,
                     prec_nodes_json, node_times_json,
                     finish_flags_json, outputs_json,
-                    path_flags_json, path_times_json,
-                    pass_review
+                    lcta_result_json, pass_review
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     node_count = VALUES(node_count),
                     prec_nodes_json = VALUES(prec_nodes_json),
                     node_times_json = VALUES(node_times_json),
                     finish_flags_json = VALUES(finish_flags_json),
                     outputs_json = VALUES(outputs_json),
-                    path_flags_json = VALUES(path_flags_json),
-                    path_times_json = VALUES(path_times_json),
+                    lcta_result_json = VALUES(lcta_result_json),
                     pass_review = VALUES(pass_review),
                     updated_at = CURRENT_TIMESTAMP
                 """,
@@ -829,8 +922,7 @@ def persist_network_nodes(
                     payloads["node_times"],
                     payloads["finish_flags"],
                     payloads["outputs"],
-                    payloads["path_flags"],
-                    payloads["path_times"],
+                    lcta_json,
                     pass_review_value,
                 ),
             )
@@ -1125,6 +1217,15 @@ def update_network(network_id: int, request: UpdateNetworkRequest):
     pass_review = False if request.passReview is None else request.passReview
     if request.draft:
         pass_review = False
+        reset_runtime = True
+        preserve_analysis = False
+    elif pass_review:
+        # Graph Network confirm: keep prior analysis / LCTA PDF if topology unchanged in DB.
+        reset_runtime = False
+        preserve_analysis = True
+    else:
+        reset_runtime = True
+        preserve_analysis = False
 
     with db_connection() as connection:
         init_schema(connection)
@@ -1138,6 +1239,8 @@ def update_network(network_id: int, request: UpdateNetworkRequest):
             request.nodes,
             pass_review=pass_review,
             network_id=network_id,
+            reset_runtime=reset_runtime,
+            preserve_analysis=preserve_analysis,
         )
 
     return row_to_saved_network_response(
@@ -1182,6 +1285,7 @@ def review_network(network_id: int, request: ReviewNetworkRequest):
 def run_lcta_analysis(network_id: int, request: RunLctaRequest):
     """
     Run LCTA in memory (load once → refresh ETS → trace → persist once).
+    Returns cached results when lcta_result_json exists (network unchanged since last run).
     Requires pass_review on the saved network.
     """
     with db_connection() as connection:
@@ -1195,6 +1299,10 @@ def run_lcta_analysis(network_id: int, request: RunLctaRequest):
                 status_code=400,
                 detail="Network must pass review before LCTA analysis",
             )
+
+        cached_lcta = _parse_lcta_result(row)
+        if cached_lcta is not None:
+            return _lcta_response_from_cache(row)
 
         node_count = int(row["node_count"])
         prec_nodes = _load_json_column(row.get("prec_nodes_json"), [])
@@ -1210,6 +1318,7 @@ def run_lcta_analysis(network_id: int, request: RunLctaRequest):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         node_inputs = network_to_inputs(result.nodes)
+        lcta_payload = _build_lcta_result_payload(result)
         persist_network_nodes(
             connection,
             request.userId,
@@ -1218,16 +1327,20 @@ def run_lcta_analysis(network_id: int, request: RunLctaRequest):
             pass_review=True,
             network_id=network_id,
             reset_runtime=False,
+            lcta_result=lcta_payload,
         )
 
     graph_base64 = network_graph_to_base64(result.nodes)
     completion = StochasticVariableModel(**result.completion_time)
+    lcta_model = LctaResultModel(**lcta_payload)
     return LctaAnalysisResponse(
         success=True,
+        cached=False,
         completionTime=completion,
         completionTimeNotation=stochastic_notation(result.completion_time),
         completionTimeMean=result.completion_mean,
         rootNodeId=result.root_id,
+        lctaResult=lcta_model,
         nodes=node_inputs,
         graph=f"data:image/png;base64,{graph_base64}",
     )

@@ -44,7 +44,7 @@ export default function Home() {
               Explore
             </button>
             <Link href="/docs" className="text-gray-300 hover:text-white transition-colors font-medium">
-              Docs
+              Q &amp; A
             </Link>
             <button className="text-gray-300 hover:text-white transition-colors font-medium">
               Contact

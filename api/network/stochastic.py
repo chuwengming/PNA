@@ -60,6 +60,59 @@ def node_time_mean(data: Dict[str, Any]) -> float:
     return float(data.get("mean", 0.0))
 
 
+def distribution_variance(
+    values: Tuple[float, ...] | List[float],
+    probabilities: Tuple[float, ...] | List[float],
+    mean: Optional[float] = None,
+) -> float:
+    """Var(X) from discrete support."""
+    vals = list(values)
+    probs = list(probabilities)
+    if not vals:
+        return 0.0
+    mu = float(mean) if mean is not None else float(
+        sum(p * v for v, p in zip(vals, probs))
+    )
+    return float(sum(p * (v - mu) ** 2 for v, p in zip(vals, probs)))
+
+
+def default_compact_output() -> Dict[str, float]:
+    """Planning / initial Output_i: E=0, Var=0."""
+    return {"mean": 0.0, "variance": 0.0}
+
+
+def is_compact_output(data: Dict[str, Any]) -> bool:
+    return "variance" in data and "values" not in data
+
+
+def compact_output_notation(mean: float, variance: float) -> str:
+    if abs(mean) <= 1e-9 and abs(variance) <= 1e-9:
+        return "[E: 0, Var: 0]"
+    return f"[E: {mean:.2f}, Var: {variance:.4f}]"
+
+
+def is_initial_compact_output(data: Dict[str, Any]) -> bool:
+    return (
+        abs(float(data.get("mean", 0.0))) <= 1e-9
+        and abs(float(data.get("variance", 0.0))) <= 1e-9
+    )
+
+
+def compact_output_from_dict(data: Dict[str, Any]) -> Dict[str, float]:
+    """Normalize full stochastic or compact dict to {mean, variance} for DB/API."""
+    if is_compact_output(data):
+        return {
+            "mean": float(data.get("mean", 0.0)),
+            "variance": float(data.get("variance", 0.0)),
+        }
+    var = stochastic_from_dict(data)
+    mean = var.expected_value()
+    return {
+        "mean": mean,
+        "variance": distribution_variance(var.values, var.probabilities, mean),
+    }
+
+
 def mu_stochastic(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Strip variance: μ(Output) → [E(Output) : 1] per LCTA path-dependency correction.

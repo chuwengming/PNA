@@ -5,27 +5,29 @@ import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 import Image from 'next/image';
 
-// ETS 隨機變數
-interface StochasticVariable {
+// 節點 Output 精簡儲存型態 [E, Var]
+interface OutputSummary {
+  mean: number;
+  variance: number;
+}
+
+interface LctaResultJson {
+  rootNodeId: number;
+  mean: number;
+  variance: number;
   values: number[];
   probabilities: number[];
-  mean: number;
-  stdDev: number;
-  method: string;
   notation?: string;
 }
 
-// ETS 節點（擴張樹節點資料結構）
+// ETS 節點（擴張樹節點資料結構 — API / 資料表顯示）
 interface Node {
   id: number;
   precNode: number[];
   nodeTime: number;
   finishFlag: boolean;
-  output: StochasticVariable;
+  output: OutputSummary;
   outputNotation?: string;
-  pathFlag: number[];
-  pathTime: StochasticVariable[];
-  pathTimeNotation?: string[];
 }
 
 interface EditableNode {
@@ -46,6 +48,7 @@ interface Network {
   precNodes?: number[][];
   nodeTimes?: number[];
   finishFlags?: boolean[];
+  lctaResult?: LctaResultJson | null;
   nodes: Node[];
   graph: string;
   passReview: boolean;
@@ -71,21 +74,26 @@ interface ValidateNodesResponse {
 interface NetworkGenerationResponse {
   success: boolean;
   nodeCount: number;
-  nodes: Array<{
-    id: number;
-    precNode: number[];
-    nodeTime: number;
-    finishFlag: boolean;
-    output: StochasticVariable;
-    outputNotation: string;
-    pathFlag: number[];
-    pathTime: StochasticVariable[];
-    pathTimeNotation: string[];
-  }>;
+  nodes: Node[];
   graph: string;
 }
 
-const INITIAL_OUTPUT_NOTATION = '[0 : 1]';
+const INITIAL_OUTPUT_NOTATION = '[E: 0, Var: 0]';
+
+const defaultOutputSummary = (): OutputSummary => ({ mean: 0, variance: 0 });
+
+const formatOutputNotation = (output: OutputSummary, notation?: string) =>
+  notation || `[E: ${output.mean.toFixed(2)}, Var: ${output.variance.toFixed(4)}]`;
+
+const lctaResultToAnalysis = (lcta: LctaResultJson, networkName: string, cached = false): LctaAnalysisResult => ({
+  networkName,
+  mean: lcta.mean,
+  variance: lcta.variance,
+  values: lcta.values,
+  probabilities: lcta.probabilities,
+  notation: lcta.notation ?? '',
+  cached,
+});
 
 interface LctaAnalysisResult {
   networkName: string;
@@ -94,6 +102,7 @@ interface LctaAnalysisResult {
   values: number[];
   probabilities: number[];
   notation: string;
+  cached?: boolean;
 }
 
 const computeDistributionVariance = (
@@ -254,15 +263,6 @@ function CompletionTimePdfChart({
   );
 }
 
-const defaultStochastic = (): StochasticVariable => ({
-  values: [0],
-  probabilities: [1],
-  mean: 0,
-  stdDev: 0,
-  method: 'initial',
-  notation: INITIAL_OUTPUT_NOTATION,
-});
-
 const editableToNode = (node: EditableNode): Node => ({
   id: node.id,
   precNode: node.precNode.trim() === ''
@@ -270,13 +270,8 @@ const editableToNode = (node: EditableNode): Node => ({
     : node.precNode.split(',').map((value) => parseInt(value.trim(), 10)),
   nodeTime: Number.isFinite(parseFloat(node.nodeTime)) ? parseFloat(node.nodeTime) : 0,
   finishFlag: node.finishFlag,
-  output: defaultStochastic(),
+  output: defaultOutputSummary(),
   outputNotation: node.outputNotation,
-  pathFlag: node.pathFlagDisplay.trim() === ''
-    ? []
-    : node.pathFlagDisplay.replace(/[\[\]]/g, '').split(',').map((v) => parseInt(v.trim(), 10)).filter((v) => !Number.isNaN(v)),
-  pathTime: [],
-  pathTimeNotation: node.pathTimeDisplay.trim() === '' ? [] : node.pathTimeDisplay.split(';').map((s) => s.trim()),
 });
 
 const nodeToEditable = (node: Node): EditableNode => ({
@@ -284,11 +279,18 @@ const nodeToEditable = (node: Node): EditableNode => ({
   precNode: node.precNode.join(', '),
   nodeTime: String(node.nodeTime),
   finishFlag: node.finishFlag,
-  outputNotation: node.outputNotation || node.output?.notation || INITIAL_OUTPUT_NOTATION,
-  pathFlagDisplay: node.pathFlag.length > 0 ? `[${node.pathFlag.join(', ')}]` : '[]',
-  pathTimeDisplay: (node.pathTimeNotation && node.pathTimeNotation.length > 0)
-    ? node.pathTimeNotation.join('; ')
-    : (node.pathTime.length > 0 ? node.pathTime.map((p) => p.notation || INITIAL_OUTPUT_NOTATION).join('; ') : '[]'),
+  outputNotation: node.outputNotation || formatOutputNotation(node.output),
+  pathFlagDisplay: '[]',
+  pathTimeDisplay: '[]',
+});
+
+const apiNodeToNode = (node: Node): Node => ({
+  id: node.id,
+  precNode: node.precNode,
+  nodeTime: node.nodeTime,
+  finishFlag: node.finishFlag,
+  output: node.output ?? defaultOutputSummary(),
+  outputNotation: node.outputNotation || formatOutputNotation(node.output ?? defaultOutputSummary()),
 });
 
 const apiErrorMessage = async (response: Response) => {
@@ -353,6 +355,7 @@ export default function DashboardPage() {
   const [isGraphing, setIsGraphing] = useState<boolean>(false);
   const [isRunningLcta, setIsRunningLcta] = useState<boolean>(false);
   const [lctaAnalysis, setLctaAnalysis] = useState<LctaAnalysisResult | null>(null);
+  const [showNodeTable, setShowNodeTable] = useState<boolean>(true);
   const [resolvedUserId, setResolvedUserId] = useState<number | null>(null);
   const [isResolvingDbUser, setIsResolvingDbUser] = useState(false);
 
@@ -570,8 +573,7 @@ export default function DashboardPage() {
       precNode: n.precNode,
       nodeTime: n.nodeTime,
       finishFlag: false,
-      pathFlag: [],
-      pathTime: [],
+      output: defaultOutputSummary(),
     }));
 
   const filterValidModalNodes = () =>
@@ -624,6 +626,11 @@ export default function DashboardPage() {
 
       const saved: Network = await response.json();
       upsertNetworkInState(saved);
+      setNodes(saved.nodes.map(apiNodeToNode));
+      setCurrentNodeId(saved.nodes.length);
+      setShowNodeTable(true);
+      setLctaAnalysis(null);
+      setNetworkGraph('');
       setNetworkName('');
       setShowNetworkNameModal(false);
       setShowAddNodeModal(false);
@@ -668,15 +675,33 @@ export default function DashboardPage() {
       }
 
       const saved: Network = await response.json();
-      upsertNetworkInState(saved);
+      upsertNetworkInState({ ...saved, passReview: false, lctaResult: null });
+      setNodes(saved.nodes.map(apiNodeToNode));
+      setCurrentNodeId(saved.nodes.length);
+      setShowNodeTable(true);
+      setLctaAnalysis(null);
+      setNetworkGraph('');
+      setSelectedNetwork('');
       setShowEditNodeModal(false);
       setIsEditingTable(false);
       setSelectedNetworkForEdit('');
       setEditingNetworkId(null);
-      alert(`Network "${saved.name}" updated. Please run Review Network again before graphing.`);
+      alert(`Network "${saved.name}" updated. Analysis results were reset — please run Review Network again.`);
     } catch (error) {
       console.error('Error updating network:', error);
       alert(error instanceof Error ? error.message : 'Failed to update network.');
+    }
+  };
+
+  const applyLctaResultsToView = (net: Network, cached = false) => {
+    setNodes(net.nodes.map(apiNodeToNode));
+    setCurrentNodeId(net.nodes.length);
+    setShowNodeTable(true);
+    if (net.lctaResult) {
+      setLctaAnalysis(lctaResultToAnalysis(net.lctaResult, net.name, cached));
+    }
+    if (net.graph) {
+      setNetworkGraph(net.graph);
     }
   };
 
@@ -702,6 +727,12 @@ export default function DashboardPage() {
     setGenerationError('');
 
     try {
+      // Reuse saved LCTA PDF when network topology was not changed (Edit save clears this).
+      if (network.lctaResult) {
+        applyLctaResultsToView(network, true);
+        return;
+      }
+
       const response = await fetch(`/api/python/networks/${networkId}/lcta`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -713,28 +744,27 @@ export default function DashboardPage() {
       }
 
       const data = await response.json();
-      const completion = data.completionTime as StochasticVariable;
-      const values = (completion?.values ?? []).map((v: number) => Number(v));
-      const probabilities = (completion?.probabilities ?? []).map((p: number) => Number(p));
-      const mean = typeof data.completionTimeMean === 'number'
-        ? data.completionTimeMean
-        : Number(completion?.mean ?? 0);
-      const variance = computeDistributionVariance(values, probabilities, mean);
+      const analyzedNodes: Node[] = (data.nodes ?? []).map(apiNodeToNode);
+      const updatedNetwork: Network = {
+        ...network,
+        nodes: analyzedNodes,
+        lctaResult: data.lctaResult ?? network.lctaResult,
+        passReview: true,
+      };
+      setNodes(analyzedNodes);
+      setCurrentNodeId(analyzedNodes.length);
+      setShowNodeTable(true);
 
-      setLctaAnalysis({
-        networkName: network.name,
-        mean,
-        variance,
-        values,
-        probabilities,
-        notation: data.completionTimeNotation ?? completion?.notation ?? '',
-      });
+      if (data.lctaResult) {
+        setLctaAnalysis(lctaResultToAnalysis(data.lctaResult, network.name, Boolean(data.cached)));
+      }
 
       if (data.graph) {
         setNetworkGraph(data.graph);
+        updatedNetwork.graph = data.graph;
       }
 
-      await reloadNetworks();
+      upsertNetworkInState(updatedNetwork);
     } catch (error) {
       console.error('LCTA analysis failed:', error);
       alert(error instanceof Error ? error.message : 'LCTA analysis failed.');
@@ -746,12 +776,12 @@ export default function DashboardPage() {
   // 選擇網路（分析區顯示）
   const handleSelectNetwork = async (networkId: string) => {
     setSelectedNetwork(networkId);
-    setLctaAnalysis(null);
     const network = reviewedNetworks.find((n) => String(n.id) === networkId);
     if (!network) return;
 
-    setNodes([...network.nodes]);
+    setNodes(network.nodes.map(apiNodeToNode));
     setCurrentNodeId(network.nodes.length);
+    setLctaAnalysis(network.lctaResult ? lctaResultToAnalysis(network.lctaResult, network.name, true) : null);
 
     if (network.graph) {
       setNetworkGraph(network.graph);
@@ -816,17 +846,7 @@ export default function DashboardPage() {
       const data: NetworkGenerationResponse = await response.json();
       
       if (data.success) {
-        const convertedNodes: Node[] = data.nodes.map((node) => ({
-          id: node.id,
-          precNode: node.precNode,
-          nodeTime: node.nodeTime,
-          finishFlag: node.finishFlag,
-          output: node.output,
-          outputNotation: node.outputNotation,
-          pathFlag: node.pathFlag,
-          pathTime: node.pathTime,
-          pathTimeNotation: node.pathTimeNotation,
-        }));
+        const convertedNodes: Node[] = data.nodes.map(apiNodeToNode);
 
         const saveResponse = await fetch('/api/python/networks/graph', {
           method: 'POST',
@@ -848,6 +868,8 @@ export default function DashboardPage() {
 
         setNodes(convertedNodes);
         setCurrentNodeId(convertedNodes.length);
+        setShowNodeTable(true);
+        setLctaAnalysis(null);
         setNetworkGraph(savedNetwork.graph || data.graph);
         upsertNetworkInState({ ...savedNetwork, graph: savedNetwork.graph || data.graph, passReview: true });
         
@@ -921,8 +943,9 @@ export default function DashboardPage() {
       
       const data: Network = await response.json();
       
-      setNodes(data.nodes);
+      setNodes(data.nodes.map(apiNodeToNode));
       setCurrentNodeId(data.nodes.length);
+      setShowNodeTable(true);
       setNetworkGraph(graphData.graph);
       upsertNetworkInState({ ...data, graph: graphData.graph, passReview: true });
       
@@ -1015,7 +1038,7 @@ export default function DashboardPage() {
                 onClick={() => router.push('/docs')}
                 className="text-gray-300 hover:text-white transition-colors font-medium"
               >
-                Docs
+                Q &amp; A
               </button>
               <button className="text-gray-300 hover:text-white transition-colors font-medium">
                 Contact
@@ -1250,26 +1273,36 @@ export default function DashboardPage() {
                 本機與線上為<strong>不同資料庫</strong>，在本機建立的 network 不會自動出現在 Railway。
               </div>
             )}
-            {/* Current Nodes Table (hidden after LCTA — per-node outputs not shown) */}
-            {nodes.length > 0 && !lctaAnalysis && (
-              <div className="bg-slate-800/50 backdrop-blur-sm rounded-xl p-6 border border-blue-500/30">
-                <h2 className="text-2xl font-bold text-white mb-4 flex items-center">
+            {/* Network Visualization Area */}
+            <div className="bg-slate-800/50 backdrop-blur-sm rounded-xl p-6 border border-blue-500/30">
+              <div className="flex items-center justify-between mb-4 gap-4">
+                <h2 className="text-2xl font-bold text-white flex items-center">
                   <svg className="w-6 h-6 mr-2 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
                   </svg>
-                  Network Visualization
+                  Network Structure Visualization
                 </h2>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left">
+                {nodes.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setShowNodeTable((prev) => !prev)}
+                    className="px-3 py-1.5 text-sm rounded-lg border border-slate-600 text-gray-300 hover:text-white hover:border-cyan-400/50 transition-colors shrink-0"
+                  >
+                    {showNodeTable ? '收合資料表' : '展開資料表'}
+                  </button>
+                )}
+              </div>
+
+              {nodes.length > 0 && showNodeTable && (
+                <div className="mb-6 overflow-x-auto rounded-lg border border-slate-700/50 bg-slate-900/40">
+                  <table className="w-full text-left text-sm">
                     <thead>
                       <tr className="border-b border-blue-500/30">
                         <th className="py-3 px-4 text-cyan-400 font-semibold">Node ID</th>
                         <th className="py-3 px-4 text-cyan-400 font-semibold">Prec Node</th>
                         <th className="py-3 px-4 text-cyan-400 font-semibold">Node Time</th>
                         <th className="py-3 px-4 text-cyan-400 font-semibold">Finish Flag</th>
-                        <th className="py-3 px-4 text-cyan-400 font-semibold">Output</th>
-                        <th className="py-3 px-4 text-cyan-400 font-semibold">Path Flag</th>
-                        <th className="py-3 px-4 text-cyan-400 font-semibold">Path Time</th>
+                        <th className="py-3 px-4 text-cyan-400 font-semibold">Output [E, Var]</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1279,25 +1312,15 @@ export default function DashboardPage() {
                           <td className="py-3 px-4 text-gray-300">{node.precNode.length > 0 ? `[${node.precNode.join(', ')}]` : '[]'}</td>
                           <td className="py-3 px-4 text-gray-300">{typeof node.nodeTime === 'number' ? node.nodeTime.toFixed(2) : node.nodeTime}</td>
                           <td className="py-3 px-4 text-gray-300">{node.finishFlag.toString()}</td>
-                          <td className="py-3 px-4 text-gray-300 text-xs">{node.outputNotation || node.output?.notation || INITIAL_OUTPUT_NOTATION}</td>
-                          <td className="py-3 px-4 text-gray-300">{node.pathFlag.length > 0 ? `[${node.pathFlag.join(', ')}]` : '[]'}</td>
-                          <td className="py-3 px-4 text-gray-300 text-xs">{(node.pathTimeNotation && node.pathTimeNotation.length > 0) ? node.pathTimeNotation.join('; ') : '[]'}</td>
+                          <td className="py-3 px-4 text-gray-300 text-xs">
+                            {node.outputNotation || formatOutputNotation(node.output)}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
-              </div>
-            )}
-
-            {/* Network Visualization Area */}
-            <div className="bg-slate-800/50 backdrop-blur-sm rounded-xl p-6 border border-blue-500/30">
-              <h2 className="text-2xl font-bold text-white mb-4 flex items-center">
-                <svg className="w-6 h-6 mr-2 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-                </svg>
-                Network Structure Visualization
-              </h2>
+              )}
               <div className="bg-slate-900/50 rounded-lg p-8 min-h-96 flex items-center justify-center border-2 border-dashed border-blue-500/30">
                 {isGenerating ? (
                   <div className="text-center">
@@ -1348,6 +1371,11 @@ export default function DashboardPage() {
                       <span className="px-3 py-1 rounded-full bg-amber-500/20 text-amber-300 text-sm border border-amber-500/30">
                         LCTA — {lctaAnalysis.networkName}
                       </span>
+                      {lctaAnalysis.cached && (
+                        <span className="px-3 py-1 rounded-full bg-emerald-500/15 text-emerald-300 text-sm border border-emerald-500/30">
+                          已載入先前計算結果
+                        </span>
+                      )}
                       <span className="text-gray-500 text-sm">
                         {lctaAnalysis.values.length} discrete support points
                       </span>

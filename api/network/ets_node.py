@@ -10,10 +10,12 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from api.network.stochastic import (
+    compact_output_from_dict,
+    compact_output_notation,
+    default_compact_output,
     initial_stochastic,
     node_time_mean,
     stochastic_from_mean,
-    stochastic_notation,
     stochastic_to_dict,
 )
 
@@ -82,19 +84,29 @@ class ETSNode:
             "pathTime": list(self.path_time),
         }
 
-    def to_api_node(self) -> Dict[str, Any]:
-        """API payload for frontend tables."""
+    def to_api_node(self, *, compact_output: bool = True) -> Dict[str, Any]:
+        """API payload for frontend tables (Output as [E, Var] when compact_output=True)."""
         d = self.to_dict()
+        if compact_output:
+            summary = compact_output_from_dict(d["output"])
+            return {
+                "id": d["id"],
+                "precNode": d["precNode"],
+                "nodeTime": d["nodeTime"],
+                "finishFlag": d["finishFlag"],
+                "output": summary,
+                "outputNotation": compact_output_notation(summary["mean"], summary["variance"]),
+            }
         return {
             "id": d["id"],
             "precNode": d["precNode"],
             "nodeTime": d["nodeTime"],
             "finishFlag": d["finishFlag"],
             "output": d["output"],
-            "outputNotation": stochastic_notation(d["output"]),
-            "pathFlag": d["pathFlag"],
-            "pathTime": d["pathTime"],
-            "pathTimeNotation": [stochastic_notation(p) for p in d["pathTime"]],
+            "outputNotation": compact_output_notation(
+                compact_output_from_dict(d["output"])["mean"],
+                compact_output_from_dict(d["output"])["variance"],
+            ),
         }
 
 
@@ -123,7 +135,8 @@ def default_finish_flags(node_count: int) -> List[bool]:
 
 
 def default_outputs(node_count: int) -> List[Dict[str, Any]]:
-    return [initial_stochastic() for _ in range(node_count)]
+    """Default compact outputs for DB (planning phase)."""
+    return [default_compact_output() for _ in range(node_count)]
 
 
 def default_path_flags(prec_nodes: List[List[int]]) -> List[List[int]]:
