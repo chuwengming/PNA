@@ -25,7 +25,7 @@ from api.network.ets_node import (
     default_outputs,
     ets_nodes_from_planning,
 )
-from api.analysis.lcta import LCTAError, run_lcta
+from api.analysis.lcta import LCTAError, run_cpa, run_lcta
 from api.network.stochastic import (
     compact_output_from_dict,
     compact_output_notation,
@@ -221,6 +221,21 @@ class UpdateEtsRuntimeRequest(BaseModel):
 
 class RunLctaRequest(BaseModel):
     userId: int
+
+
+class RunCpaRequest(BaseModel):
+    userId: int
+    mode: str = Field(description="'longest' or 'shortest'")
+
+
+class CpaAnalysisResponse(BaseModel):
+    success: bool
+    mode: str
+    criticalPath: List[int]
+    totalExpectedTime: float
+    rootNodeId: int
+    nodes: List[NodeInput]
+    graph: str
 
 
 class LctaAnalysisResponse(BaseModel):
@@ -1279,6 +1294,53 @@ def review_network(network_id: int, request: ReviewNetworkRequest):
         row = fetch_network_row(connection, network_id, request.userId)
 
     return row_to_saved_network_response(row, include_graph=False)
+
+
+@app.post("/api/python/networks/{network_id}/cpa", response_model=CpaAnalysisResponse)
+def run_cpa_analysis(network_id: int, request: RunCpaRequest):
+    """
+    CPA (LCTA + SDO): longest or shortest critical path. Results are not persisted to DB.
+    """
+    mode = request.mode.strip().lower()
+    if mode not in ("longest", "shortest"):
+        raise HTTPException(status_code=400, detail="CPA mode must be 'longest' or 'shortest'")
+
+    with db_connection() as connection:
+        init_schema(connection)
+        migrate_schema(connection)
+        ensure_user_exists(connection, request.userId)
+        row = fetch_network_row(connection, network_id, request.userId)
+
+        if not bool(row.get("pass_review", 0)):
+            raise HTTPException(
+                status_code=400,
+                detail="Network must pass review before CPA analysis",
+            )
+
+        node_count = int(row["node_count"])
+        prec_nodes = _load_json_column(row.get("prec_nodes_json"), [])
+        planning_means = _load_json_column(row.get("node_times_json"), [])
+
+        if len(prec_nodes) != node_count or len(planning_means) != node_count:
+            raise HTTPException(status_code=500, detail="儲存的 ETS 節點資料長度不一致")
+
+        nodes = ets_nodes_from_planning(node_count, prec_nodes, planning_means)
+        try:
+            result = run_cpa(nodes, mode, planning_means=planning_means, refresh=True)
+        except LCTAError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    node_inputs = network_to_inputs(result.nodes)
+    graph_base64 = network_graph_to_base64(result.nodes)
+    return CpaAnalysisResponse(
+        success=True,
+        mode=result.mode,
+        criticalPath=result.critical_path,
+        totalExpectedTime=result.total_expected_time,
+        rootNodeId=result.root_id,
+        nodes=node_inputs,
+        graph=f"data:image/png;base64,{graph_base64}",
+    )
 
 
 @app.post("/api/python/networks/{network_id}/lcta", response_model=LctaAnalysisResponse)

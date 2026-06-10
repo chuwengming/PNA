@@ -105,6 +105,13 @@ interface LctaAnalysisResult {
   cached?: boolean;
 }
 
+interface CpaAnalysisResult {
+  networkName: string;
+  mode: 'longest' | 'shortest';
+  criticalPath: number[];
+  totalExpectedTime: number;
+}
+
 const computeDistributionVariance = (
   values: number[],
   probabilities: number[],
@@ -354,7 +361,9 @@ export default function DashboardPage() {
   const [graphNetworkName, setGraphNetworkName] = useState<string>('');
   const [isGraphing, setIsGraphing] = useState<boolean>(false);
   const [isRunningLcta, setIsRunningLcta] = useState<boolean>(false);
+  const [isRunningCpa, setIsRunningCpa] = useState<boolean>(false);
   const [lctaAnalysis, setLctaAnalysis] = useState<LctaAnalysisResult | null>(null);
+  const [cpaAnalysis, setCpaAnalysis] = useState<CpaAnalysisResult | null>(null);
   const [showNodeTable, setShowNodeTable] = useState<boolean>(true);
   const [resolvedUserId, setResolvedUserId] = useState<number | null>(null);
   const [isResolvingDbUser, setIsResolvingDbUser] = useState(false);
@@ -480,6 +489,7 @@ export default function DashboardPage() {
     setNodes([]);
     setNetworkGraph('');
     setLctaAnalysis(null);
+    setCpaAnalysis(null);
   };
 
   const handleSignOut = async () => {
@@ -724,6 +734,7 @@ export default function DashboardPage() {
 
     setIsRunningLcta(true);
     setLctaAnalysis(null);
+    setCpaAnalysis(null);
     setGenerationError('');
 
     try {
@@ -773,9 +784,65 @@ export default function DashboardPage() {
     }
   };
 
+  const handleRunCpa = async (mode: 'longest' | 'shortest') => {
+    if (!selectedNetwork) {
+      alert('Please select a reviewed network for CPA analysis.');
+      return;
+    }
+    if (!hasDbUser) {
+      alert('Please sign in with a database-backed account.');
+      return;
+    }
+
+    const networkId = Number(selectedNetwork);
+    const network = reviewedNetworks.find((n) => n.id === networkId);
+    if (!network) {
+      alert('Selected network not found.');
+      return;
+    }
+
+    setIsRunningCpa(true);
+    setLctaAnalysis(null);
+    setCpaAnalysis(null);
+    setGenerationError('');
+
+    try {
+      const response = await fetch(`/api/python/networks/${networkId}/cpa`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: effectiveUserId, mode }),
+      });
+
+      if (!response.ok) {
+        throw new Error(await apiErrorMessage(response));
+      }
+
+      const data = await response.json();
+      const analyzedNodes: Node[] = (data.nodes ?? []).map(apiNodeToNode);
+      setNodes(analyzedNodes);
+      setCurrentNodeId(analyzedNodes.length);
+      setShowNodeTable(true);
+      setCpaAnalysis({
+        networkName: network.name,
+        mode: data.mode,
+        criticalPath: data.criticalPath,
+        totalExpectedTime: data.totalExpectedTime,
+      });
+      if (data.graph) {
+        setNetworkGraph(data.graph);
+      }
+    } catch (error) {
+      console.error('CPA analysis failed:', error);
+      alert(error instanceof Error ? error.message : 'CPA analysis failed.');
+    } finally {
+      setIsRunningCpa(false);
+    }
+  };
+
   // 選擇網路（分析區顯示）
   const handleSelectNetwork = async (networkId: string) => {
     setSelectedNetwork(networkId);
+    setCpaAnalysis(null);
     const network = reviewedNetworks.find((n) => String(n.id) === networkId);
     if (!network) return;
 
@@ -1210,22 +1277,36 @@ export default function DashboardPage() {
                   </p>
                 </div>
                 <button
-                  onClick={clearDisplayAreas}
-                  className="w-full px-4 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium text-sm flex items-center justify-center"
+                  onClick={() => handleRunCpa('shortest')}
+                  disabled={!selectedNetwork || isRunningCpa || isRunningLcta || !hasDbUser}
+                  className="w-full px-4 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium text-sm flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
-                  </svg>
-                  Shortest Path
+                  {isRunningCpa ? (
+                    <span className="animate-pulse">Running CPA...</span>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
+                      </svg>
+                      Shortest Path (CPA)
+                    </>
+                  )}
                 </button>
                 <button
-                  onClick={clearDisplayAreas}
-                  className="w-full px-4 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium text-sm flex items-center justify-center"
+                  onClick={() => handleRunCpa('longest')}
+                  disabled={!selectedNetwork || isRunningCpa || isRunningLcta || !hasDbUser}
+                  className="w-full px-4 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium text-sm flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 17h8m0 0V9m0 8l-8-8-4 4-6-6" />
-                  </svg>
-                  Longest Path
+                  {isRunningCpa ? (
+                    <span className="animate-pulse">Running CPA...</span>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 17h8m0 0V9m0 8l-8-8-4 4-6-6" />
+                      </svg>
+                      Longest Path (CPA)
+                    </>
+                  )}
                 </button>
                 <button
                   onClick={clearDisplayAreas}
@@ -1365,6 +1446,37 @@ export default function DashboardPage() {
                     <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-amber-400 mb-4" />
                     <p className="text-gray-400">Running LCTA analysis...</p>
                   </div>
+                ) : isRunningCpa ? (
+                  <div className="flex flex-col items-center justify-center py-16 text-center">
+                    <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-cyan-400 mb-4" />
+                    <p className="text-gray-400">Running CPA analysis...</p>
+                  </div>
+                ) : cpaAnalysis ? (
+                  <div className="space-y-6">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <span className="px-3 py-1 rounded-full bg-cyan-500/20 text-cyan-300 text-sm border border-cyan-500/30">
+                        CPA — {cpaAnalysis.mode === 'longest' ? 'Longest Path' : 'Shortest Path'}
+                      </span>
+                      <span className="text-gray-500 text-sm">{cpaAnalysis.networkName}</span>
+                    </div>
+
+                    <div className="rounded-lg bg-slate-800/80 border border-cyan-500/20 p-4">
+                      <p className="text-sm text-gray-400 mb-2">Critical path (start → root)</p>
+                      <p className="text-xl font-mono text-white tracking-wide">
+                        {cpaAnalysis.criticalPath.join(' → ')}
+                      </p>
+                    </div>
+
+                    <div className="rounded-lg bg-slate-800/80 border border-amber-500/20 p-4">
+                      <p className="text-sm text-gray-400 mb-1">Total expected path time</p>
+                      <p className="text-3xl font-bold text-amber-300 tabular-nums">
+                        {cpaAnalysis.totalExpectedTime.toFixed(2)}
+                      </p>
+                      <p className="text-xs text-gray-500 mt-1">
+                        Sum of Node_Time means along the critical path
+                      </p>
+                    </div>
+                  </div>
                 ) : lctaAnalysis ? (
                   <div className="space-y-6">
                     <div className="flex flex-wrap items-center gap-3">
@@ -1418,7 +1530,8 @@ export default function DashboardPage() {
                     </svg>
                     <p className="text-gray-400 text-lg mb-2">Analyze the Selected Network</p>
                     <p className="text-gray-500 text-sm">
-                      Run <span className="text-amber-300">Network Completion Time (LCTA)</span> to see results here
+                      Run <span className="text-cyan-300">Shortest/Longest Path (CPA)</span> or{' '}
+                      <span className="text-amber-300">Network Completion Time (LCTA)</span>
                     </p>
                   </div>
                 )}

@@ -8,7 +8,9 @@ correction. See docs/source/LCTA追蹤程序.pdf and docs/definitions/08-lcta-pa
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
+
+SDOMode = Optional[Literal["longest", "shortest"]]
 
 from api.analysis.convolution import convolution
 from api.analysis.discretization import DiscretizedVariable
@@ -25,6 +27,61 @@ from api.network.stochastic import (
 
 class LCTAError(Exception):
     """Invalid network state or tracing failure during LCTA."""
+
+
+def sdo(node: ETSNode, mode: Literal["longest", "shortest"]) -> None:
+    """
+  Stochastic Duration Ordering SDO(i) per Critical Path Algorithm.pdf.
+
+  Reorders Prec_Node, Path_Flag, Path_Time by E(Y_k^i) before max merge.
+  longest: ascending (small→left, large→right); shortest: descending.
+  """
+    node.sync_path_arrays()
+    if len(node.prec_node) <= 1:
+        return
+
+    indices = list(range(len(node.prec_node)))
+
+    def path_expected(idx: int) -> float:
+        return stochastic_from_dict(node.path_time[idx]).expected_value()
+
+    indices.sort(key=path_expected, reverse=(mode == "shortest"))
+    node.prec_node = [node.prec_node[i] for i in indices]
+    node.path_flag = [node.path_flag[i] for i in indices]
+    node.path_time = [node.path_time[i] for i in indices]
+
+
+def extract_critical_path(nodes: List[ETSNode], root_id: int) -> List[int]:
+    """Rightmost-edge path from root to start (0), returned start→root."""
+    path: List[int] = []
+    current = root_id
+    while True:
+        path.append(current)
+        if current == 0:
+            break
+        node = nodes[current]
+        node.sync_path_arrays()
+        if not node.prec_node:
+            raise LCTAError(f"Cannot trace critical path: node {current} has no predecessors")
+        current = node.prec_node[-1]
+    path.reverse()
+    return path
+
+
+def critical_path_expected_time(nodes: List[ETSNode], path: List[int]) -> float:
+    """Sum of Node_Time planning means along the critical path."""
+    return sum(nodes[node_id].node_time_mean for node_id in path)
+
+
+@dataclass
+class CPAResult:
+    """Outcome of CPA (LCTA + SDO) for longest or shortest critical path."""
+
+    nodes: List[ETSNode]
+    critical_path: List[int]
+    total_expected_time: float
+    mode: Literal["longest", "shortest"]
+    root_id: int
 
 
 @dataclass
@@ -62,7 +119,7 @@ class LCTAEngine:
     Conventions: start node = 0, root = N - 1.
   """
 
-    def __init__(self, nodes: List[ETSNode]):
+    def __init__(self, nodes: List[ETSNode], *, sdo_mode: SDOMode = None):
         if len(nodes) < 2:
             raise LCTAError("LCTA requires at least 2 nodes (start and root)")
         self.nodes = nodes
@@ -71,6 +128,7 @@ class LCTAEngine:
         self.root = self.n - 1
         self.stack = _LCTAStack()
         self.shared_flag = 0
+        self.sdo_mode = sdo_mode
 
     def _root_finished(self) -> bool:
         return bool(self.nodes[self.root].finish_flag)
@@ -155,6 +213,9 @@ class LCTAEngine:
                 self.downward_tracing(next_pred)
                 return
 
+            if len(node_j.prec_node) > 1 and self.sdo_mode is not None:
+                sdo(node_j, self.sdo_mode)
+
             merged = self._max_path_times(j)
             node_time_var = stochastic_from_dict(node_j.node_time)
             output_var = convolution(merged, node_time_var)
@@ -200,5 +261,41 @@ def run_lcta(
     return LCTAResult(
         nodes=nodes,
         completion_time=dict(root.output),
+        root_id=engine.root,
+    )
+
+
+def run_cpa(
+    nodes: List[ETSNode],
+    mode: Literal["longest", "shortest"],
+    planning_means: Optional[List[float]] = None,
+    *,
+    refresh: bool = True,
+) -> CPAResult:
+    """
+    Critical Path Analysis: LCTA with SDO(i) before each max merge.
+
+    See docs/source/Critical Path Algorithm.pdf.
+    """
+    if mode not in ("longest", "shortest"):
+        raise LCTAError("CPA mode must be 'longest' or 'shortest'")
+
+    if refresh:
+        prepare_network_for_lcta(nodes, planning_means)
+
+    engine = LCTAEngine(nodes, sdo_mode=mode)
+    engine.downward_tracing(engine.root)
+
+    if not engine.nodes[engine.root].finish_flag:
+        raise LCTAError("CPA finished without computing root node output")
+
+    critical_path = extract_critical_path(nodes, engine.root)
+    total_time = critical_path_expected_time(nodes, critical_path)
+
+    return CPAResult(
+        nodes=nodes,
+        critical_path=critical_path,
+        total_expected_time=total_time,
+        mode=mode,
         root_id=engine.root,
     )
