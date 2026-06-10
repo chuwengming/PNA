@@ -37,6 +37,9 @@ class ETSNode:
         self.path_flag: List[int] = []
         self.path_time: List[Dict[str, Any]] = []
         self.node_time: Dict[str, Any] = initial_stochastic()
+        # Find-path algorithm runtime only (not persisted to DB)
+        self.path_sequence: List[List[List[int]]] = []
+        self.total_sequence: List[List[int]] = []
 
     @property
     def id(self) -> int:
@@ -55,6 +58,14 @@ class ETSNode:
         while len(self.path_time) < n:
             self.path_time.append(initial_stochastic())
         self.path_time = self.path_time[:n]
+
+    def sync_sequence_arrays(self) -> None:
+        """Keep Path_Flag / Path_Sequence length aligned with Prec_Node."""
+        self.sync_path_arrays()
+        n = len(self.prec_node)
+        while len(self.path_sequence) < n:
+            self.path_sequence.append([])
+        self.path_sequence = self.path_sequence[:n]
 
     def set_prec_node(self, predecessors: List[int]) -> None:
         self.prec_node = sorted(predecessors)
@@ -160,3 +171,22 @@ def prepare_network_for_lcta(
         mean = float(planning_means[i]) if planning_means is not None else node.node_time_mean
         node.reset_runtime_state()
         node.set_node_time_mean(mean)
+
+
+def prepare_network_for_find_paths(
+    nodes: List[ETSNode],
+    planning_means: Optional[List[float]] = None,
+) -> None:
+    """
+    Reset runtime fields for Find Path Algorithm (no stochastic computation).
+
+    Initializes Path_Sequence to empty lists per predecessor; Total_Sequence to [].
+    """
+    for i, node in enumerate(nodes):
+        if planning_means is not None:
+            node.set_node_time_mean(float(planning_means[i]))
+        node.finish_flag = False
+        node.sync_sequence_arrays()
+        node.path_flag = [0] * len(node.prec_node)
+        node.path_sequence = [[] for _ in node.prec_node]
+        node.total_sequence = []

@@ -25,6 +25,7 @@ from api.network.ets_node import (
     default_outputs,
     ets_nodes_from_planning,
 )
+from api.analysis.find_paths import FindPathError, run_find_paths
 from api.analysis.lcta import LCTAError, run_cpa, run_lcta
 from api.network.stochastic import (
     compact_output_from_dict,
@@ -233,6 +234,19 @@ class CpaAnalysisResponse(BaseModel):
     mode: str
     criticalPath: List[int]
     totalExpectedTime: float
+    rootNodeId: int
+    nodes: List[NodeInput]
+    graph: str
+
+
+class RunFindPathsRequest(BaseModel):
+    userId: int
+
+
+class FindPathsAnalysisResponse(BaseModel):
+    success: bool
+    pathCount: int
+    paths: List[List[int]]
     rootNodeId: int
     nodes: List[NodeInput]
     graph: str
@@ -1294,6 +1308,48 @@ def review_network(network_id: int, request: ReviewNetworkRequest):
         row = fetch_network_row(connection, network_id, request.userId)
 
     return row_to_saved_network_response(row, include_graph=False)
+
+
+@app.post("/api/python/networks/{network_id}/find-paths", response_model=FindPathsAnalysisResponse)
+def run_find_paths_analysis(network_id: int, request: RunFindPathsRequest):
+    """
+    Find Path Algorithm: enumerate all start→root paths. Results are not persisted to DB.
+    """
+    with db_connection() as connection:
+        init_schema(connection)
+        migrate_schema(connection)
+        ensure_user_exists(connection, request.userId)
+        row = fetch_network_row(connection, network_id, request.userId)
+
+        if not bool(row.get("pass_review", 0)):
+            raise HTTPException(
+                status_code=400,
+                detail="Network must pass review before path enumeration",
+            )
+
+        node_count = int(row["node_count"])
+        prec_nodes = _load_json_column(row.get("prec_nodes_json"), [])
+        planning_means = _load_json_column(row.get("node_times_json"), [])
+
+        if len(prec_nodes) != node_count or len(planning_means) != node_count:
+            raise HTTPException(status_code=500, detail="儲存的 ETS 節點資料長度不一致")
+
+        nodes = ets_nodes_from_planning(node_count, prec_nodes, planning_means)
+        try:
+            result = run_find_paths(nodes, planning_means=planning_means, refresh=True)
+        except FindPathError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    node_inputs = network_to_inputs(result.nodes)
+    graph_base64 = network_graph_to_base64(result.nodes)
+    return FindPathsAnalysisResponse(
+        success=True,
+        pathCount=result.path_count,
+        paths=result.paths,
+        rootNodeId=result.root_id,
+        nodes=node_inputs,
+        graph=f"data:image/png;base64,{graph_base64}",
+    )
 
 
 @app.post("/api/python/networks/{network_id}/cpa", response_model=CpaAnalysisResponse)

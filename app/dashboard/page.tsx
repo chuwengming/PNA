@@ -112,6 +112,12 @@ interface CpaAnalysisResult {
   totalExpectedTime: number;
 }
 
+interface FindPathsAnalysisResult {
+  networkName: string;
+  pathCount: number;
+  paths: number[][];
+}
+
 const computeDistributionVariance = (
   values: number[],
   probabilities: number[],
@@ -362,8 +368,10 @@ export default function DashboardPage() {
   const [isGraphing, setIsGraphing] = useState<boolean>(false);
   const [isRunningLcta, setIsRunningLcta] = useState<boolean>(false);
   const [isRunningCpa, setIsRunningCpa] = useState<boolean>(false);
+  const [isRunningFindPaths, setIsRunningFindPaths] = useState<boolean>(false);
   const [lctaAnalysis, setLctaAnalysis] = useState<LctaAnalysisResult | null>(null);
   const [cpaAnalysis, setCpaAnalysis] = useState<CpaAnalysisResult | null>(null);
+  const [findPathsAnalysis, setFindPathsAnalysis] = useState<FindPathsAnalysisResult | null>(null);
   const [showNodeTable, setShowNodeTable] = useState<boolean>(true);
   const [resolvedUserId, setResolvedUserId] = useState<number | null>(null);
   const [isResolvingDbUser, setIsResolvingDbUser] = useState(false);
@@ -490,6 +498,7 @@ export default function DashboardPage() {
     setNetworkGraph('');
     setLctaAnalysis(null);
     setCpaAnalysis(null);
+    setFindPathsAnalysis(null);
   };
 
   const handleSignOut = async () => {
@@ -735,6 +744,7 @@ export default function DashboardPage() {
     setIsRunningLcta(true);
     setLctaAnalysis(null);
     setCpaAnalysis(null);
+    setFindPathsAnalysis(null);
     setGenerationError('');
 
     try {
@@ -804,6 +814,7 @@ export default function DashboardPage() {
     setIsRunningCpa(true);
     setLctaAnalysis(null);
     setCpaAnalysis(null);
+    setFindPathsAnalysis(null);
     setGenerationError('');
 
     try {
@@ -839,10 +850,66 @@ export default function DashboardPage() {
     }
   };
 
+  const handleRunFindPaths = async () => {
+    if (!selectedNetwork) {
+      alert('Please select a reviewed network for path enumeration.');
+      return;
+    }
+    if (!hasDbUser) {
+      alert('Please sign in with a database-backed account.');
+      return;
+    }
+
+    const networkId = Number(selectedNetwork);
+    const network = reviewedNetworks.find((n) => n.id === networkId);
+    if (!network) {
+      alert('Selected network not found.');
+      return;
+    }
+
+    setIsRunningFindPaths(true);
+    setLctaAnalysis(null);
+    setCpaAnalysis(null);
+    setFindPathsAnalysis(null);
+    setGenerationError('');
+
+    try {
+      const response = await fetch(`/api/python/networks/${networkId}/find-paths`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: effectiveUserId }),
+      });
+
+      if (!response.ok) {
+        throw new Error(await apiErrorMessage(response));
+      }
+
+      const data = await response.json();
+      const analyzedNodes: Node[] = (data.nodes ?? []).map(apiNodeToNode);
+      setNodes(analyzedNodes);
+      setCurrentNodeId(analyzedNodes.length);
+      setShowNodeTable(true);
+      setFindPathsAnalysis({
+        networkName: network.name,
+        pathCount: data.pathCount,
+        paths: data.paths,
+      });
+      if (data.graph) {
+        setNetworkGraph(data.graph);
+      }
+    } catch (error) {
+      console.error('Find-path analysis failed:', error);
+      alert(error instanceof Error ? error.message : 'Find-path analysis failed.');
+    } finally {
+      setIsRunningFindPaths(false);
+    }
+  };
+
   // 選擇網路（分析區顯示）
   const handleSelectNetwork = async (networkId: string) => {
     setSelectedNetwork(networkId);
     setCpaAnalysis(null);
+    setFindPathsAnalysis(null);
     const network = reviewedNetworks.find((n) => String(n.id) === networkId);
     if (!network) return;
 
@@ -1278,7 +1345,7 @@ export default function DashboardPage() {
                 </div>
                 <button
                   onClick={() => handleRunCpa('shortest')}
-                  disabled={!selectedNetwork || isRunningCpa || isRunningLcta || !hasDbUser}
+                  disabled={!selectedNetwork || isRunningCpa || isRunningLcta || isRunningFindPaths || !hasDbUser}
                   className="w-full px-4 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium text-sm flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {isRunningCpa ? (
@@ -1294,7 +1361,7 @@ export default function DashboardPage() {
                 </button>
                 <button
                   onClick={() => handleRunCpa('longest')}
-                  disabled={!selectedNetwork || isRunningCpa || isRunningLcta || !hasDbUser}
+                  disabled={!selectedNetwork || isRunningCpa || isRunningLcta || isRunningFindPaths || !hasDbUser}
                   className="w-full px-4 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium text-sm flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {isRunningCpa ? (
@@ -1309,17 +1376,24 @@ export default function DashboardPage() {
                   )}
                 </button>
                 <button
-                  onClick={clearDisplayAreas}
-                  className="w-full px-4 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium text-sm flex items-center justify-center"
+                  onClick={handleRunFindPaths}
+                  disabled={!selectedNetwork || isRunningFindPaths || isRunningCpa || isRunningLcta || !hasDbUser}
+                  className="w-full px-4 py-3 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-all font-medium text-sm flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
-                  </svg>
-                  Total Path Number
+                  {isRunningFindPaths ? (
+                    <span className="animate-pulse">Running...</span>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                      </svg>
+                      Network Path List
+                    </>
+                  )}
                 </button>
                 <button
                   onClick={handleRunLcta}
-                  disabled={!selectedNetwork || isRunningLcta || !hasDbUser}
+                  disabled={!selectedNetwork || isRunningLcta || isRunningFindPaths || !hasDbUser}
                   className="w-full px-4 py-3 bg-gradient-to-r from-amber-500 to-orange-500 text-white rounded-lg hover:from-amber-600 hover:to-orange-600 transition-all font-medium text-sm flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {isRunningLcta ? (
@@ -1451,6 +1525,49 @@ export default function DashboardPage() {
                     <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-cyan-400 mb-4" />
                     <p className="text-gray-400">Running CPA analysis...</p>
                   </div>
+                ) : isRunningFindPaths ? (
+                  <div className="flex flex-col items-center justify-center py-16 text-center">
+                    <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-emerald-400 mb-4" />
+                    <p className="text-gray-400">Enumerating network paths...</p>
+                  </div>
+                ) : findPathsAnalysis ? (
+                  <div className="space-y-6">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <span className="px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-300 text-sm border border-emerald-500/30">
+                        Network Path List
+                      </span>
+                      <span className="text-gray-500 text-sm">{findPathsAnalysis.networkName}</span>
+                    </div>
+
+                    <div className="rounded-lg bg-slate-800/80 border border-emerald-500/20 p-4">
+                      <p className="text-sm text-gray-400 mb-1">Total path count</p>
+                      <p className="text-3xl font-bold text-emerald-300 tabular-nums">
+                        {findPathsAnalysis.pathCount}
+                      </p>
+                    </div>
+
+                    <div>
+                      <h3 className="text-white font-semibold mb-3">
+                        All paths (Total_Sequence at root)
+                      </h3>
+                      <div className="rounded-lg bg-slate-950/60 border border-slate-700/50 divide-y divide-slate-700/50 max-h-80 overflow-y-auto">
+                        {findPathsAnalysis.paths.length === 0 ? (
+                          <p className="p-4 text-gray-500 text-sm">No paths found.</p>
+                        ) : (
+                          findPathsAnalysis.paths.map((path, index) => (
+                            <div key={index} className="px-4 py-3 flex items-baseline gap-3">
+                              <span className="text-gray-500 text-xs font-mono shrink-0 w-8">
+                                #{index + 1}
+                              </span>
+                              <span className="text-white font-mono text-sm tracking-wide">
+                                {path.join(' → ')}
+                              </span>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  </div>
                 ) : cpaAnalysis ? (
                   <div className="space-y-6">
                     <div className="flex flex-wrap items-center gap-3">
@@ -1530,7 +1647,8 @@ export default function DashboardPage() {
                     </svg>
                     <p className="text-gray-400 text-lg mb-2">Analyze the Selected Network</p>
                     <p className="text-gray-500 text-sm">
-                      Run <span className="text-cyan-300">Shortest/Longest Path (CPA)</span> or{' '}
+                      Run <span className="text-emerald-300">Network Path List</span>,{' '}
+                      <span className="text-cyan-300">Shortest/Longest Path (CPA)</span>, or{' '}
                       <span className="text-amber-300">Network Completion Time (LCTA)</span>
                     </p>
                   </div>
