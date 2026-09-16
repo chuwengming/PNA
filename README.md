@@ -57,6 +57,7 @@ Required environment variables:
 - `GOOGLE_CLIENT_ID`
 - `GOOGLE_CLIENT_SECRET`
 - `PYTHON_API_URL=http://127.0.0.1:8000`
+- `MCP_API_KEY` — optional operations fallback for Hermes. Users should normally create keys in Dashboard → **API KEY**. Generate a fallback with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Do not commit it.
 
 ### Google OAuth on Railway (`redirect_uri_mismatch`)
 
@@ -77,9 +78,35 @@ Usually means the Next.js server cannot reach FastAPI inside the container. Chec
 
 If a database password has appeared in chat or logs, rotate it in Railway (MySQL → reset credentials) and update `DATABASE_URL`.
 
-The Railway start command runs FastAPI on `127.0.0.1:8000` and Next.js on Railway's public port. Next.js rewrites `/api/python/*` requests to FastAPI through `PYTHON_API_URL`.
+The Railway start command runs FastAPI on `127.0.0.1:8000` and Next.js on Railway's public port. Next.js rewrites `/api/python/*` and `/mcp` to FastAPI through `PYTHON_API_URL`. Bearer auth for MCP is enforced by FastAPI (environment `MCP_API_KEY` **or** a key created in Dashboard → API KEY).
 
-## Data Model (MySQL, 2 tables)
+### Hermes Agent (MCP)
+
+PNA exposes Streamable HTTP MCP at `https://your-app.up.railway.app/mcp`. Tools run **on PNA**, not in Hermes:
+
+| Tool | What PNA does |
+|------|----------------|
+| `validate_network` | Same planning rules as Dashboard Review (`validate_node_inputs`) |
+| `analyze_project_network` | In-memory CPA longest/shortest + Find Paths (no DB write, no PNG) |
+
+Hermes config (`~/.hermes/config.yaml`):
+
+```yaml
+mcp_servers:
+  pna:
+    url: "https://your-app.up.railway.app/mcp"
+    headers:
+      Authorization: "Bearer ${PNA_MCP_API_KEY}"
+    timeout: 180
+    tools:
+      include: [validate_network, analyze_project_network]
+      resources: false
+      prompts: false
+```
+
+Create `PNA_MCP_API_KEY` in PNA Dashboard → **API KEY** (application name → generate → copy). Put that value in `~/.hermes/.env`. The optional Railway `MCP_API_KEY` is only a fallback. Then `/reload-mcp` or start a new `hermes chat`. Hermes registers `mcp_pna_validate_network` and `mcp_pna_analyze_project_network`.
+
+## Data Model (MySQL, 3 tables)
 
 FastAPI initializes these tables on startup (or run `db/schema.sql` on Railway):
 
@@ -87,8 +114,9 @@ FastAPI initializes these tables on startup (or run `db/schema.sql` on Railway):
 |-------|---------|
 | `users` | Login accounts (email / Google OAuth) |
 | `saved_networks` | Persisted networks per user (`user_id` → `users.id`) |
+| `api_keys` | Per-user MCP keys (`email`, `app_name`, `api_key`, `key_hash`) |
 
-**`saved_networks` columns (ETS):** `prec_nodes_json`, `node_times_json`, `finish_flags_json`, `outputs_json`, `path_flags_json`, `path_times_json`, `pass_review`. See `docs/definitions/07-ets-node-structure.md`.
+**`saved_networks` columns (ETS):** `prec_nodes_json`, `node_times_json`, `finish_flags_json`, `outputs_json`, `lcta_result_json`, `pass_review`. Startup drops legacy `path_flags_json` / `path_times_json` if present. See `docs/definitions/07-ets-node-structure.md`.
 
 **Workflow:** Create Network / Edit Network / Review Network / Graph Network / Random Generate all persist to `saved_networks`. Reload the page and use **Edit Network** to continue editing.
 

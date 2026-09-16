@@ -1,4 +1,4 @@
--- Railway MySQL: users + saved_networks (ETS node structure)
+-- Railway MySQL: users + saved_networks + api_keys
 
 
 
@@ -57,6 +57,38 @@ CREATE TABLE IF NOT EXISTS saved_networks (
   UNIQUE KEY uq_saved_networks_user_name (user_id, name),
 
   CONSTRAINT fk_saved_networks_user
+
+    FOREIGN KEY (user_id)
+
+    REFERENCES users(id)
+
+    ON DELETE CASCADE
+
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+
+CREATE TABLE IF NOT EXISTS api_keys (
+
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+  user_id BIGINT NOT NULL,
+
+  email VARCHAR(255) NOT NULL,
+
+  app_name VARCHAR(191) NOT NULL,
+
+  api_key VARCHAR(191) NOT NULL,
+
+  key_hash CHAR(64) NOT NULL,
+
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_api_keys_hash (key_hash),
+
+  UNIQUE KEY uq_api_keys_user_app (user_id, app_name),
+
+  CONSTRAINT fk_api_keys_user
 
     FOREIGN KEY (user_id)
 

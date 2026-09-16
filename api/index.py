@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import random
@@ -42,6 +43,14 @@ from api.network.stochastic import (
 from api.rag.config import DOCS_INDEX_FILE
 from api.rag.ingest import build_index, index_status
 from api.rag.query import GenerationError, GenerationQuotaError, answer_question
+from api.mcp_server import get_mcp_asgi_app
+from api.api_keys import (
+    CREATE_API_KEYS_TABLE_SQL,
+    authorize_mcp_bearer,
+    create_api_key,
+    delete_api_key,
+    list_api_keys,
+)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -59,7 +68,39 @@ def _load_local_env():
 
 _load_local_env()
 
-app = FastAPI()
+mcp_asgi_app = get_mcp_asgi_app()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if mcp_asgi_app is not None:
+        async with mcp_asgi_app.lifespan(app):
+            _ensure_docs_index()
+            startup_mysql()
+            yield
+        return
+    print("[mcp] FastMCP unavailable; /mcp is disabled")
+    _ensure_docs_index()
+    startup_mysql()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+if mcp_asgi_app is not None:
+    app.mount("/mcp", mcp_asgi_app)
+
+
+@app.middleware("http")
+async def mcp_bearer_auth(request: Request, call_next):
+    path = request.url.path
+    if path == "/mcp" or path.startswith("/mcp/"):
+        ok, status, message = authorize_mcp_bearer(
+            request.headers.get("authorization") or ""
+        )
+        if not ok:
+            return JSONResponse(status_code=status, content={"message": message})
+    return await call_next(request)
 
 
 def _ensure_docs_index() -> None:
@@ -78,10 +119,6 @@ def _ensure_docs_index() -> None:
             "[docs-rag] 請在本機執行: npm run build-docs-index"
         )
 
-
-@app.on_event("startup")
-def prepare_docs_index() -> None:
-    _ensure_docs_index()
 
 class UserRegisterRequest(BaseModel):
     email: str
@@ -191,6 +228,21 @@ class DocsIndexStatusResponse(BaseModel):
     embedding_provider: Optional[str] = None
     embedding_model: Optional[str] = None
     embedding_dimension: Optional[int] = None
+
+
+class CreateApiKeyRequest(BaseModel):
+    userId: int
+    email: str
+    appName: str
+
+
+class ApiKeyRecordResponse(BaseModel):
+    id: int
+    userId: int
+    email: str
+    appName: str
+    apiKey: str
+    createdAt: str
 
 
 class SaveNetworkRequest(BaseModel):
@@ -332,6 +384,7 @@ def init_schema(connection):
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """
         )
+        cursor.execute(CREATE_API_KEYS_TABLE_SQL)
 
 
 def migrate_schema(connection):
@@ -492,8 +545,7 @@ def migrate_schema(connection):
                 cursor.execute(f"ALTER TABLE saved_networks DROP COLUMN {legacy_col}")
 
 
-@app.on_event("startup")
-def startup():
+def startup_mysql():
     if not (os.getenv("DATABASE_URL") or os.getenv("MYSQL_URL") or os.getenv("MYSQL_HOST")):
         print("WARN: MySQL env not set for FastAPI")
         return
@@ -1500,6 +1552,35 @@ def list_networks(userId: int, includeGraph: bool = False):
         row_to_saved_network_response(row, include_graph=includeGraph)
         for row in rows
     ]
+
+
+# BFF-only. Public Next rewrite /api/python/api-keys is 403; Dashboard uses /api/api-keys.
+@app.get("/api/python/api-keys", response_model=List[ApiKeyRecordResponse])
+def get_user_api_keys(userId: int):
+    with db_connection() as connection:
+        init_schema(connection)
+        migrate_schema(connection)
+        ensure_user_exists(connection, userId)
+    return list_api_keys(userId)
+
+
+@app.post("/api/python/api-keys", response_model=ApiKeyRecordResponse)
+def post_user_api_key(request: CreateApiKeyRequest):
+    with db_connection() as connection:
+        init_schema(connection)
+        migrate_schema(connection)
+        ensure_user_exists(connection, request.userId)
+    return create_api_key(request.userId, request.email, request.appName)
+
+
+@app.delete("/api/python/api-keys/{key_id}")
+def delete_user_api_key(key_id: int, userId: int):
+    with db_connection() as connection:
+        init_schema(connection)
+        migrate_schema(connection)
+        ensure_user_exists(connection, userId)
+    delete_api_key(userId, key_id)
+    return {"success": True}
 
 
 @app.get("/api/python/docs/status", response_model=DocsIndexStatusResponse)

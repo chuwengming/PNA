@@ -23,20 +23,27 @@ if (!isVenvReady()) {
   process.exit(1);
 }
 
+function pythonModuleOk(moduleName) {
+  return (
+    spawnSync(python, ['-c', `import ${moduleName}`], {
+      cwd: projectRoot,
+      stdio: 'ignore',
+    }).status === 0
+  );
+}
+
 const canSkip =
   fs.existsSync(markerFile) &&
-  spawnSync(python, ['-m', 'uvicorn', '--version'], {
-    cwd: projectRoot,
-    stdio: 'ignore',
-  }).status === 0;
+  pythonModuleOk('uvicorn') &&
+  pythonModuleOk('fastmcp');
 
 if (canSkip) {
-  console.log('[install-python] skip (venv has uvicorn)');
+  console.log('[install-python] skip (venv has uvicorn and fastmcp)');
   process.exit(0);
 }
 
 if (fs.existsSync(markerFile)) {
-  console.log('[install-python] marker present but uvicorn missing — reinstalling');
+  console.log('[install-python] marker present but uvicorn/fastmcp missing — reinstalling');
   fs.unlinkSync(markerFile);
 }
 

@@ -4,6 +4,7 @@ import { useSession, signOut } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 import Image from 'next/image';
+import ApiKeyModal from './ApiKeyModal';
 
 // 節點 Output 精簡儲存型態 [E, Var]
 interface OutputSummary {
@@ -329,6 +330,7 @@ export default function DashboardPage() {
   const [showNetworkNameModal, setShowNetworkNameModal] = useState<boolean>(false);
   const [showReviewNodeModal, setShowReviewNodeModal] = useState<boolean>(false);
   const [showReviewErrorsModal, setShowReviewErrorsModal] = useState<boolean>(false);
+  const [showApiKeyModal, setShowApiKeyModal] = useState<boolean>(false);
   
   // 節點資料
   const [nodes, setNodes] = useState<Node[]>([]);
@@ -1164,17 +1166,23 @@ export default function DashboardPage() {
             </a>
 
             {/* Menu Items */}
-            <div className="hidden md:flex items-center space-x-6">
-              <button className="text-gray-300 hover:text-white transition-colors font-medium">
+            <div className="flex items-center space-x-6">
+              <button className="hidden md:inline text-gray-300 hover:text-white transition-colors font-medium">
                 Explore
               </button>
               <button
                 onClick={() => router.push('/docs')}
-                className="text-gray-300 hover:text-white transition-colors font-medium"
+                className="hidden md:inline text-gray-300 hover:text-white transition-colors font-medium"
               >
                 Q &amp; A
               </button>
-              <button className="text-gray-300 hover:text-white transition-colors font-medium">
+              <button
+                onClick={() => setShowApiKeyModal(true)}
+                className="text-cyan-400 hover:text-white transition-colors font-medium"
+              >
+                API KEY
+              </button>
+              <button className="hidden md:inline text-gray-300 hover:text-white transition-colors font-medium">
                 Contact
               </button>
             </div>
@@ -1660,6 +1668,11 @@ export default function DashboardPage() {
       </div>
 
       {/* Add Node Modal */}
+      <ApiKeyModal
+        open={showApiKeyModal}
+        onClose={() => setShowApiKeyModal(false)}
+        accountEmail={session.user?.email || ''}
+      />
       {showAddNodeModal && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <div className="bg-slate-800 rounded-2xl p-8 max-w-4xl w-full border border-blue-500/30 shadow-2xl flex flex-col max-h-[90vh]">
