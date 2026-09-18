@@ -17,18 +17,39 @@ const HOP_BY_HOP = new Set([
   'content-length',
 ]);
 
+const INTERNAL_REDIRECT = new Set([301, 302, 303, 307, 308]);
+
 function pythonBase(): string {
   return (process.env.PYTHON_API_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
 }
 
+function pythonOrigin(): URL {
+  return new URL(`${pythonBase()}/`);
+}
+
+function isInternalUrl(url: URL): boolean {
+  return (
+    url.hostname === '127.0.0.1' ||
+    url.hostname === 'localhost' ||
+    url.host === pythonOrigin().host
+  );
+}
+
 function targetUrl(request: NextRequest): string {
-  return `${pythonBase()}${request.nextUrl.pathname}${request.nextUrl.search}`;
+  const base = pythonBase();
+  let pathname = request.nextUrl.pathname;
+  // FastAPI/Starlette mount lives at /mcp/; Next.js 308s public /mcp/ back to /mcp.
+  if (pathname === '/mcp') {
+    pathname = '/mcp/';
+  }
+  return `${base}${pathname}${request.nextUrl.search}`;
 }
 
 function copyRequestHeaders(request: NextRequest): Headers {
   const headers = new Headers();
   request.headers.forEach((value, key) => {
-    if (HOP_BY_HOP.has(key.toLowerCase())) {
+    const lower = key.toLowerCase();
+    if (HOP_BY_HOP.has(lower) || lower.startsWith('x-forwarded-')) {
       return;
     }
     headers.set(key, value);
@@ -36,29 +57,81 @@ function copyRequestHeaders(request: NextRequest): Headers {
   return headers;
 }
 
-async function proxyMcp(request: NextRequest): Promise<NextResponse> {
-  const init: RequestInit = {
-    method: request.method,
-    headers: copyRequestHeaders(request),
-    redirect: 'manual',
-  };
-  if (request.method !== 'GET' && request.method !== 'HEAD') {
-    init.body = Buffer.from(await request.arrayBuffer());
+function sanitizeLocation(
+  value: string,
+  upstreamUrl: string,
+  publicOrigin: string,
+): string {
+  try {
+    const loc = new URL(value, upstreamUrl);
+    if (!isInternalUrl(loc)) {
+      return loc.toString();
+    }
+    const path = loc.pathname === '/mcp/' ? '/mcp' : loc.pathname;
+    return `${publicOrigin}${path}${loc.search}`;
+  } catch {
+    return value;
   }
+}
+
+async function proxyMcp(request: NextRequest): Promise<NextResponse> {
+  const headers = copyRequestHeaders(request);
+  const publicOrigin = request.nextUrl.origin;
+  let url = targetUrl(request);
+  const body =
+    request.method !== 'GET' && request.method !== 'HEAD'
+      ? Buffer.from(await request.arrayBuffer())
+      : undefined;
 
   try {
-    const upstream = await fetch(targetUrl(request), init);
-    const responseHeaders = new Headers();
-    upstream.headers.forEach((value, key) => {
-      if (HOP_BY_HOP.has(key.toLowerCase())) {
-        return;
+    for (let hop = 0; hop < 5; hop += 1) {
+      const init: RequestInit = {
+        method: request.method,
+        headers,
+        redirect: 'manual',
+        cache: 'no-store',
+      };
+      if (body) {
+        init.body = body;
       }
-      responseHeaders.set(key, value);
-    });
-    return new NextResponse(upstream.body, {
-      status: upstream.status,
-      headers: responseHeaders,
-    });
+      const upstream = await fetch(url, init);
+      if (INTERNAL_REDIRECT.has(upstream.status)) {
+        const location = upstream.headers.get('location');
+        if (location) {
+          const next = new URL(location, url);
+          if (isInternalUrl(next)) {
+            const internal = pythonOrigin();
+            next.protocol = internal.protocol;
+            next.host = internal.host;
+            url = next.toString();
+            continue;
+          }
+        }
+      }
+
+      const responseHeaders = new Headers();
+      upstream.headers.forEach((value, key) => {
+        if (HOP_BY_HOP.has(key.toLowerCase())) {
+          return;
+        }
+        if (key.toLowerCase() === 'location') {
+          responseHeaders.set(
+            'location',
+            sanitizeLocation(value, url, publicOrigin),
+          );
+          return;
+        }
+        responseHeaders.set(key, value);
+      });
+      return new NextResponse(upstream.body, {
+        status: upstream.status,
+        headers: responseHeaders,
+      });
+    }
+    return NextResponse.json(
+      { message: 'MCP upstream redirect loop' },
+      { status: 502 },
+    );
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     return NextResponse.json(

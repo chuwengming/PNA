@@ -45,6 +45,7 @@
 - [x] 不得讓已登入者用公開 `/api/python/api-keys?userId=` 讀他人明文金鑰（須走 `/api/api-keys`）。
 - [x] `/mcp` 不得要求 session cookie（否則 Hermes 永遠 401）。
 - [x] FastAPI `/mcp` 的 OPTIONS 不得因缺少 Bearer 回 401（預檢不是呼叫工具）。
+- [x] 公開 `/mcp`（無尾斜線）不得回 307/308 `Location` 到 `127.0.0.1:8000`／`localhost`（Cursor 會跟著連本機而紅燈）。App Router 代理須在內部跟隨 FastAPI `/mcp/`，對外維持 `/mcp`。見 `docs/agent-memory/mcp-loopback-redirect.md`。
 - [x] 部署權威為 Railway（`railpack.json` + `npm run railway-start`）。已廢棄 `vercel.json` 與 Next 範本圖（`public/vercel.svg`、`file.svg`、`window.svg`、`globe.svg`、`next.svg`），不得再當部署或 UI 資源。UI Logo／首頁圖僅用 `public/logo.jpeg` 與 `public/network-visualization.png`。
 
 ## 7. 待確認

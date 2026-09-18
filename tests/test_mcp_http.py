@@ -85,6 +85,23 @@ def test_mcp_options_does_not_require_bearer(mcp_client):
     assert response.status_code != 503
 
 
+def test_mcp_authenticated_post_does_not_redirect_to_loopback(mcp_client):
+    response = mcp_client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}},
+        headers={
+            "Authorization": "Bearer test-mcp-secret-key-32chars-long!",
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+        },
+        follow_redirects=False,
+    )
+    location = response.headers.get("location") or ""
+    assert "127.0.0.1" not in location
+    assert "localhost" not in location
+    assert response.status_code not in (301, 302, 303, 307, 308)
+
+
 def test_mcp_tools_list_only_two_tools(mcp_client):
     response = mcp_client.post(
         "/mcp",

@@ -105,6 +105,20 @@ async def mcp_bearer_auth(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def mcp_trailing_slash(request: Request, call_next):
+    """Starlette Mount('/mcp') 307s /mcp → /mcp/ using the upstream Host.
+
+    Next.js then forwards Location: https://127.0.0.1:8000/mcp/ to Cursor,
+    which tries the loopback address and shows a red MCP light.
+    """
+    if request.scope.get("path") == "/mcp":
+        request.scope["path"] = "/mcp/"
+        if request.scope.get("raw_path") == b"/mcp":
+            request.scope["raw_path"] = b"/mcp/"
+    return await call_next(request)
+
+
 def _ensure_docs_index() -> None:
     if DOCS_INDEX_FILE.exists():
         return
