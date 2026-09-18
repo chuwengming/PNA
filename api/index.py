@@ -95,6 +95,8 @@ if mcp_asgi_app is not None:
 async def mcp_bearer_auth(request: Request, call_next):
     path = request.url.path
     if path == "/mcp" or path.startswith("/mcp/"):
+        if request.method == "OPTIONS":
+            return await call_next(request)
         ok, status, message = authorize_mcp_bearer(
             request.headers.get("authorization") or ""
         )

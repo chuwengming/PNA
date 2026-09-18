@@ -19,8 +19,7 @@ export function middleware(request: NextRequest) {
 
   const pathname = request.nextUrl.pathname;
 
-  // MCP is proxied by next.config.ts rewrite → http://127.0.0.1:8000/mcp
-  // Do not require a browser session cookie (Hermes has none). FastAPI checks Bearer.
+  // MCP is proxied by app/mcp → PYTHON_API_URL. No session cookie (Hermes / Cursor).
   if (pathname === '/mcp' || pathname.startsWith('/mcp/')) {
     return NextResponse.next();
   }

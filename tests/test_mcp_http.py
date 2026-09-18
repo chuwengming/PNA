@@ -79,6 +79,12 @@ def _mcp_sse_payload(response) -> dict:
     raise AssertionError(response.text)
 
 
+def test_mcp_options_does_not_require_bearer(mcp_client):
+    response = mcp_client.options("/mcp")
+    assert response.status_code != 401
+    assert response.status_code != 503
+
+
 def test_mcp_tools_list_only_two_tools(mcp_client):
     response = mcp_client.post(
         "/mcp",

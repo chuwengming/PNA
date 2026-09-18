@@ -78,7 +78,7 @@ Usually means the Next.js server cannot reach FastAPI inside the container. Chec
 
 If a database password has appeared in chat or logs, rotate it in Railway (MySQL → reset credentials) and update `DATABASE_URL`.
 
-The Railway start command runs FastAPI on `127.0.0.1:8000` and Next.js on Railway's public port. Next.js rewrites `/api/python/*` and `/mcp` to FastAPI through `PYTHON_API_URL`. Bearer auth for MCP is enforced by FastAPI (environment `MCP_API_KEY` **or** a key created in Dashboard → API KEY).
+The Railway start command runs FastAPI on `127.0.0.1:8000` and Next.js on Railway's public port. Next.js rewrites `/api/python/*` to FastAPI. Public `/mcp` is an App Router proxy to FastAPI that forwards `Authorization` (rewrite alone drops Bearer / SSE and Cursor shows a red MCP light). Bearer auth is enforced by FastAPI (environment `MCP_API_KEY` **or** a key created in Dashboard → API KEY). Tool arguments are `{ node, request }`.
 
 ### Hermes Agent (MCP)
 

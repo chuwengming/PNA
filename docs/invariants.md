@@ -1,7 +1,7 @@
 # Project Invariants（可執行全局契約）
 
 > 隨專案演進持續累積。每條應可被人工或 agent 驗證（可檢查、可回歸）。
-> 最後更新：2026-09-16
+> 最後更新：2026-09-18
 
 ## 1. 產品流程
 - [x] Dashboard 人機流程：建立／編輯網路 → 存成草稿（`pass_review=0`）→ Review 通過 → 才能 Graph／Find Paths／CPA／LCTA。
@@ -18,13 +18,14 @@
 
 ## 3. 環境與銜接（mock / simulation / real）
 - [x] Railway：FastAPI 只聽 `127.0.0.1:8000`；公開埠是 Next.js。
-- [x] Next.js rewrite：`/api/python/:path*` → FastAPI `/api/python/:path*`；`/mcp` 與 `/mcp/:path*` → FastAPI `/mcp`。
+- [x] Next.js rewrite：`/api/python/:path*` → FastAPI `/api/python/:path*`。公開 `/mcp` 由 App Router（`app/mcp/[[...path]]`）轉發到 FastAPI，並原樣帶上 `Authorization`／`Accept`／`mcp-session-id`；不得只靠 Next rewrite（會弄丟 Bearer 或 SSE，Cursor 會紅燈）。
 - [x] `PYTHON_API_URL` 預設 `http://127.0.0.1:8000`。
 - [x] 未設定 `MCP_API_KEY` 且 key store 可用但金鑰不存在時，無效 Bearer 回 401；完全沒有 MySQL 且沒有環境金鑰、或 MySQL 已設定但查 `api_keys` 失敗時 `/mcp` 回 503（不得把 store 故障當成錯金鑰）。Dashboard 其餘功能仍可運行。
 - [x] Next.js middleware **不得**只比對環境 `MCP_API_KEY` 而擋掉使用者申請的金鑰；`/mcp` 一律轉發 FastAPI 驗證。
 
 ## 4. 資料與設定（目錄、env 語意、預設值）
 - [x] 權威規劃 JSON：節點陣列，每點 `id`、`precNode`、`nodeTime`（AoN）。id 必須 `0..N-1`；節點 0 無前驅；`N-1` 為唯一終點。
+- [x] MCP 工具參數分兩段：`node`（規劃節點陣列；亦接受舊名 `nodes`）與 `request`（要算什麼）。`request` 可含 `longest`／`shortest`／`enumeratePaths`。不得把 `apiKey`／`userId` 放進這兩段。
 - [x] MCP 入站會去掉 `finishFlag`／`output` 等 runtime 欄位，再跑規劃驗證。
 - [x] `MCP_API_KEY`：可選的營運／後門金鑰，放 Railway Variables／本機 `.env`，禁止寫進 Git 或 MCP 工具參數。
 - [x] 使用者金鑰存在 MySQL `api_keys`（`user_id`、`email`、`app_name`、`api_key`、`key_hash`）。同一使用者的 `app_name` 不可重複。MCP 以 `key_hash`（SHA-256）查找，不掃描明文比對。
@@ -43,6 +44,7 @@
 - [x] 不得讓模型傳入的 `userId` 操作他人 `saved_networks`。
 - [x] 不得讓已登入者用公開 `/api/python/api-keys?userId=` 讀他人明文金鑰（須走 `/api/api-keys`）。
 - [x] `/mcp` 不得要求 session cookie（否則 Hermes 永遠 401）。
+- [x] FastAPI `/mcp` 的 OPTIONS 不得因缺少 Bearer 回 401（預檢不是呼叫工具）。
 - [x] 部署權威為 Railway（`railpack.json` + `npm run railway-start`）。已廢棄 `vercel.json` 與 Next 範本圖（`public/vercel.svg`、`file.svg`、`window.svg`、`globe.svg`、`next.svg`），不得再當部署或 UI 資源。UI Logo／首頁圖僅用 `public/logo.jpeg` 與 `public/network-visualization.png`。
 
 ## 7. 待確認

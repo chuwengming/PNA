@@ -73,3 +73,20 @@ def test_analyze_project_network_returns_validation_errors():
     assert result["success"] is False
     assert result["passed"] is False
     assert result["errors"]
+
+
+def test_validate_network_accepts_node_alias():
+    result = validate_network(node=_diamond_nodes(), request={})
+    assert result["passed"] is True
+    assert result["nodeCount"] == 4
+
+
+def test_analyze_project_network_node_and_request():
+    result = analyze_project_network(
+        node=_diamond_nodes(),
+        request={"longest": True, "shortest": False, "enumeratePaths": False},
+    )
+    assert result["success"] is True
+    assert "longest" in result
+    assert "shortest" not in result
+    assert "paths" not in result

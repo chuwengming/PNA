@@ -8,14 +8,6 @@ const nextConfig = {
           source: "/api/python/:path*",
           destination: `${pythonApiUrl}/api/python/:path*`,
         },
-        {
-          source: "/mcp",
-          destination: `${pythonApiUrl}/mcp`,
-        },
-        {
-          source: "/mcp/:path*",
-          destination: `${pythonApiUrl}/mcp/:path*`,
-        },
       ];
     },
   };
